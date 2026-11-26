@@ -1,6 +1,5 @@
-site_name: Crawl4AI Documentation (v0.7.x)
-site_favicon: docs/md_v2/favicon.ico
-site_description:  🚀🤖 Crawl4AI, Open-source LLM-Friendly Web Crawler & Scraper
+site_name: Crawl4AI Documentation (v0.9.x)
+site_description: Crawl4AI turns any website into LLM-ready Markdown. Call the hosted API with one key, no browsers or proxies to run, or self-host the open-source crawler.
 site_url: https://docs.crawl4ai.com
 repo_url: https://github.com/unclecode/crawl4ai
 repo_name: unclecode/crawl4ai
@@ -8,6 +7,7 @@ docs_dir: docs/md_v2
 
 nav:
   - Home: 'index.md'
+  - "Growth": "stats.md"
   - "Ask AI": "core/ask-ai.md"
   - "Quick Start": "core/quickstart.md"
   - "Code Examples": "core/examples.md"
@@ -15,9 +15,11 @@ nav:
     - "Demo Apps": "apps/index.md"
     - "C4A-Script Editor": "apps/c4a-script/index.html"
     - "LLM Context Builder": "apps/llmtxt/index.html"
+    - "Marketplace": "marketplace/index.html"
+    - "Marketplace Admin": "marketplace/admin/index.html"
   - Setup & Installation:
     - "Installation": "core/installation.md"
-    - "Docker Deployment": "core/docker-deployment.md"
+    - "Self-Hosting Guide": "core/self-hosting.md"
   - "Blog & Changelog":
     - "Blog Home": "blog/index.md"
     - "Changelog": "https://github.com/unclecode/crawl4ai/blob/main/CHANGELOG.md"
@@ -27,6 +29,7 @@ nav:
     - "Deep Crawling": "core/deep-crawling.md"
     - "Adaptive Crawling": "core/adaptive-crawling.md"
     - "URL Seeding": "core/url-seeding.md"
+    - "Domain Mapping": "core/domain-mapping.md"
     - "C4A-Script": "core/c4a-script.md"
     - "Crawler Result": "core/crawler-result.md"
     - "Browser, Crawler & LLM Config": "core/browser-crawler-config.md"
@@ -45,6 +48,7 @@ nav:
     - "Lazy Loading": "advanced/lazy-loading.md"
     - "Hooks & Auth": "advanced/hooks-auth.md"
     - "Proxy & Security": "advanced/proxy-security.md"
+    - "Anti-Bot & Fallback": "advanced/anti-bot-and-fallback.md"
     - "Undetected Browser": "advanced/undetected-browser.md"
     - "Session Management": "advanced/session-management.md"
     - "Multi-URL Crawling": "advanced/multi-url-crawling.md"
@@ -66,10 +70,20 @@ nav:
     - "CrawlResult": "api/crawl-result.md"
     - "Strategies": "api/strategies.md"
     - "C4A-Script Reference": "api/c4a-script-reference.md"
+  - "Brand Book": "branding/index.md"
+  - Community:
+    - "Contributing Guide": "CONTRIBUTING.md"
+    - "Code of Conduct": "https://github.com/unclecode/crawl4ai/blob/main/CODE_OF_CONDUCT.md"
+    - "Contributors": "https://github.com/unclecode/crawl4ai/blob/main/CONTRIBUTORS.md"
+  - Legal:
+    - "Privacy Policy": "privacy.md"
+    - "Terms of Service": "terms.md"
+    - "Support": "support.md"
 
 theme:
   name: 'terminal'
   palette: 'dark'
+  favicon: favicon.ico
   custom_dir: docs/md_v2/overrides
   color_mode: 'dark'
   icon:
@@ -90,6 +104,8 @@ markdown_extensions:
   - tables
 
 extra:
+  # the docs home page title in search results (overrides/main.html)
+  home_title: "Crawl4AI Docs: Open-Source Crawler and Hosted Crawling API"
   version: !ENV [CRAWL4AI_VERSION, 'development']
 
 extra_css:
@@ -98,6 +114,8 @@ extra_css:
   - assets/highlight.css
   - assets/dmvendor.css
   - assets/feedback-overrides.css
+  - assets/page_actions.css
+  - assets/cloud-strip.css
 
 extra_javascript:
   - https://www.googletagmanager.com/gtag/js?id=G-58W0K2ZQ25
@@ -106,8 +124,10 @@ extra_javascript:
   - assets/highlight_init.js
   - https://buttons.github.io/buttons.js
   - assets/toc.js
-  - assets/github_stats.js 
+  - assets/github_stats.js
   - assets/selection_ask_ai.js
   - assets/copy_code.js
   - assets/floating_ask_ai_button.js
   - assets/mobile_menu.js
+  - assets/cloud-strip.js
+  - assets/page_actions.js?v=20251006

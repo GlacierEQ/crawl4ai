@@ -18,7 +18,7 @@ A comprehensive web-based tutorial for learning and experimenting with C4A-Scrip
 
 2. **Install Dependencies**
    ```bash
-   pip install flask
+   pip install -r requirements.txt
    ```
 
 3. **Launch the Server**
@@ -28,10 +28,10 @@ A comprehensive web-based tutorial for learning and experimenting with C4A-Scrip
 
 4. **Open in Browser**
    ```
-   http://localhost:8080
+   http://localhost:8000
    ```
 
-**🌐 Try Online**: [Live Demo](https://docs.crawl4ai.com/c4a-script/demo)
+**🌐 Try Online**: [Live Demo](https://docs.crawl4ai.com/apps/c4a-script/)
 
 ### 2. Try Your First Script
 
@@ -325,7 +325,7 @@ Powers the recording functionality:
 ### Configuration
 ```python
 # server.py configuration
-PORT = 8080
+PORT = 8000
 DEBUG = True
 THREADED = True
 ```
@@ -343,9 +343,9 @@ THREADED = True
 **Port Already in Use**
 ```bash
 # Kill existing process
-lsof -ti:8080 | xargs kill -9
+lsof -ti:8000 | xargs kill -9
 # Or use different port
-python server.py --port 8081
+python server.py --port 8001
 ```
 
 **Blockly Not Loading**
@@ -365,7 +365,7 @@ Enable detailed logging by setting `DEBUG = True` in `assets/app.js`
 
 - **[C4A-Script Documentation](../../md_v2/core/c4a-script.md)** - Complete language guide
 - **[API Reference](../../md_v2/api/c4a-script-reference.md)** - Detailed command documentation
-- **[Live Demo](https://docs.crawl4ai.com/c4a-script/demo)** - Try without installation
+- **[Live Demo](https://docs.crawl4ai.com/apps/c4a-script/)** - Try without installation
 - **[Example Scripts](../)** - More automation examples
 
 ## 🤝 Contributing

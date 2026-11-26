@@ -19,7 +19,8 @@ import re
 from pathlib import Path
 
 from crawl4ai.async_webcrawler import AsyncWebCrawler
-from crawl4ai.async_configs import CrawlerRunConfig, LinkPreviewConfig
+from crawl4ai.async_configs import CrawlerRunConfig, LinkPreviewConfig, LLMConfig
+from crawl4ai.config import DEFAULT_PROVIDER
 from crawl4ai.models import Link, CrawlResult
 import numpy as np
 
@@ -178,7 +179,8 @@ class AdaptiveConfig:
     
     # Embedding strategy parameters
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    embedding_llm_config: Optional[Dict] = None  # Separate config for embeddings
+    embedding_llm_config: Optional[Union[LLMConfig, Dict]] = None  # Separate config for embeddings
+    query_llm_config: Optional[Union[LLMConfig, Dict]] = None  # Config for query expansion (chat completion)
     n_query_variations: int = 10
     coverage_threshold: float = 0.85
     alpha_shape_alpha: float = 0.5
@@ -206,6 +208,9 @@ class AdaptiveConfig:
     # Example: Links with >0.85 similarity to existing KB get penalized to avoid redundancy
     # Lower = more aggressive deduplication, Higher = allow more similar content
     
+    # Link preview timeout (seconds)
+    link_preview_timeout: float = 5.0
+
     # Embedding stopping criteria parameters
     embedding_min_relative_improvement: float = 0.1  # Minimum relative improvement to continue
     # Example: If confidence is 0.6, need improvement > 0.06 per batch to continue crawling
@@ -250,6 +255,24 @@ class AdaptiveConfig:
         assert 0 <= self.embedding_quality_max_confidence <= 1, "embedding_quality_max_confidence must be between 0 and 1"
         assert self.embedding_quality_scale_factor > 0, "embedding_quality_scale_factor must be positive"
         assert 0 <= self.embedding_min_confidence_threshold <= 1, "embedding_min_confidence_threshold must be between 0 and 1"
+    
+    @property
+    def _embedding_llm_config_dict(self) -> Optional[Dict]:
+        """Convert LLMConfig to dict format for backward compatibility."""
+        if self.embedding_llm_config is None:
+            return None
+        if isinstance(self.embedding_llm_config, dict):
+            return self.embedding_llm_config
+        return self.embedding_llm_config.to_dict()
+
+    @property
+    def _query_llm_config_dict(self) -> Optional[Dict]:
+        """Convert query LLM config to dict format."""
+        if self.query_llm_config is None:
+            return None
+        if isinstance(self.query_llm_config, dict):
+            return self.query_llm_config
+        return self.query_llm_config.to_dict()
 
 
 class CrawlStrategy(ABC):
@@ -593,9 +616,10 @@ class StatisticalStrategy(CrawlStrategy):
 class EmbeddingStrategy(CrawlStrategy):
     """Embedding-based adaptive crawling using semantic space coverage"""
     
-    def __init__(self, embedding_model: str = None, llm_config: Dict = None):
+    def __init__(self, embedding_model: str = None, llm_config: Union[LLMConfig, Dict] = None, query_llm_config: Union[LLMConfig, Dict] = None):
         self.embedding_model = embedding_model or "sentence-transformers/all-MiniLM-L6-v2"
         self.llm_config = llm_config
+        self.query_llm_config = query_llm_config
         self._embedding_cache = {}
         self._link_embedding_cache = {}  # Cache for link embeddings
         self._validation_passed = False  # Track if validation passed
@@ -605,14 +629,51 @@ class EmbeddingStrategy(CrawlStrategy):
         self._kb_embeddings_hash = None  # Track KB changes
         self._validation_embeddings_cache = None  # Cache validation query embeddings
         self._kb_similarity_threshold = 0.95  # Threshold for deduplication
-        
+    
+    def _get_embedding_llm_config_dict(self) -> Optional[Dict]:
+        """Get embedding LLM config as dict, or None for local embeddings."""
+        if hasattr(self, 'config') and self.config:
+            config_dict = self.config._embedding_llm_config_dict
+            if config_dict:
+                return config_dict
+
+        # Return None to use local sentence-transformers embeddings
+        return None
+
+    def _get_query_llm_config_dict(self) -> Optional[Dict]:
+        """Get query LLM config as dict for chat completion calls.
+
+        Fallback chain:
+        1. self.query_llm_config (explicit query config on strategy)
+        2. self.config._query_llm_config_dict (from AdaptiveConfig)
+        3. self.llm_config (legacy: single config for both)
+        4. None (caller uses hardcoded defaults)
+        """
+        # 1. Explicit query config on strategy instance
+        if self.query_llm_config is not None:
+            if isinstance(self.query_llm_config, dict):
+                return self.query_llm_config
+            return self.query_llm_config.to_dict()
+
+        # 2. From AdaptiveConfig
+        if hasattr(self, 'config') and self.config:
+            config_dict = self.config._query_llm_config_dict
+            if config_dict:
+                return config_dict
+
+        # 3. Legacy fallback: use embedding/shared llm_config for backward compat
+        if self.llm_config is not None:
+            if isinstance(self.llm_config, dict):
+                return self.llm_config
+            return self.llm_config.to_dict()
+
+        # 4. None — caller applies hardcoded defaults
+        return None
+
     async def _get_embeddings(self, texts: List[str]) -> Any:
         """Get embeddings using configured method"""
         from .utils import get_text_embeddings
-        embedding_llm_config = {
-            'provider': 'openai/text-embedding-3-small',
-            'api_token': os.getenv('OPENAI_API_KEY')
-        }
+        embedding_llm_config = self._get_embedding_llm_config_dict()
         return await get_text_embeddings(
             texts, 
             embedding_llm_config,
@@ -676,24 +737,31 @@ class EmbeddingStrategy(CrawlStrategy):
         These should be queries a user might ask when looking for similar information.
         Include different phrasings, related concepts, and specific aspects.
         
-        Return as a JSON array of strings."""
+        Return a JSON object of the form {{"queries": ["...", "..."]}}."""
         
-        # Use the LLM for query generation
-        provider = self.llm_config.get('provider', 'openai/gpt-4o-mini') if self.llm_config else 'openai/gpt-4o-mini'
-        api_token = self.llm_config.get('api_token') if self.llm_config else None
+        # Use a chat completion model for query generation
+        llm_config_dict = self._get_query_llm_config_dict()
+
+        provider = llm_config_dict.get('provider', DEFAULT_PROVIDER) if llm_config_dict else DEFAULT_PROVIDER
+        api_token = llm_config_dict.get('api_token') if llm_config_dict else None
+        base_url = llm_config_dict.get('base_url') if llm_config_dict else None
+
+        response = perform_completion_with_backoff(
+            provider=provider,
+            prompt_with_variables=prompt,
+            api_token=api_token,
+            json_response=True,
+            base_url=base_url,
+            base_delay=llm_config_dict.get('backoff_base_delay', 2) if llm_config_dict else 2,
+            max_attempts=llm_config_dict.get('backoff_max_attempts', 3) if llm_config_dict else 3,
+            exponential_factor=llm_config_dict.get('backoff_exponential_factor', 2) if llm_config_dict else 2,
+        )
         
-        # response = perform_completion_with_backoff(
-        #     provider=provider,
-        #     prompt_with_variables=prompt,
-        #     api_token=api_token,
-        #     json_response=True
-        # )
-        
-        # variations = json.loads(response.choices[0].message.content)
+        variations = json.loads(response.choices[0].message.content)
         
         
         # # Mock data with more variations for split
-        variations ={'queries': ['what are the best vegetables to use in fried rice?', 'how do I make vegetable fried rice from scratch?', 'can you provide a quick recipe for vegetable fried rice?', 'what cooking techniques are essential for perfect fried rice with vegetables?', 'how to add flavor to vegetable fried rice?', 'are there any tips for making healthy fried rice with vegetables?']}
+        # variations ={'queries': ['what are the best vegetables to use in fried rice?', 'how do I make vegetable fried rice from scratch?', 'can you provide a quick recipe for vegetable fried rice?', 'what cooking techniques are essential for perfect fried rice with vegetables?', 'how to add flavor to vegetable fried rice?', 'are there any tips for making healthy fried rice with vegetables?']}
         
         
         # variations = {'queries': [
@@ -843,10 +911,7 @@ class EmbeddingStrategy(CrawlStrategy):
         
         # Batch embed only uncached links
         if texts_to_embed:
-            embedding_llm_config = {
-                'provider': 'openai/text-embedding-3-small',
-                'api_token': os.getenv('OPENAI_API_KEY')
-            }
+            embedding_llm_config = self._get_embedding_llm_config_dict()
             new_embeddings = await get_text_embeddings(texts_to_embed, embedding_llm_config, self.embedding_model)
 
             # Cache the new embeddings
@@ -1184,10 +1249,7 @@ class EmbeddingStrategy(CrawlStrategy):
             return
             
         # Get embeddings for new texts
-        embedding_llm_config = {
-            'provider': 'openai/text-embedding-3-small',
-            'api_token': os.getenv('OPENAI_API_KEY')
-        }        
+        embedding_llm_config = self._get_embedding_llm_config_dict()      
         new_embeddings = await get_text_embeddings(new_texts, embedding_llm_config, self.embedding_model)
 
         # Deduplicate embeddings before adding to KB
@@ -1256,10 +1318,13 @@ class AdaptiveCrawler:
         if strategy_name == "statistical":
             return StatisticalStrategy()
         elif strategy_name == "embedding":
-            return EmbeddingStrategy(
+            strategy = EmbeddingStrategy(
                 embedding_model=self.config.embedding_model,
-                llm_config=self.config.embedding_llm_config
+                llm_config=self.config.embedding_llm_config,
+                query_llm_config=self.config.query_llm_config,
             )
+            strategy.config = self.config  # Pass config to strategy
+            return strategy
         else:
             raise ValueError(f"Unknown strategy: {strategy_name}")
     
@@ -1311,11 +1376,10 @@ class AdaptiveCrawler:
                         if isinstance(result.links, dict):
                             # Extract internal and external links from dict
                             internal_links = [Link(**link) for link in result.links.get('internal', [])]
-                            external_links = [Link(**link) for link in result.links.get('external', [])]
-                            self.state.pending_links.extend(internal_links + external_links)
+                            self.state.pending_links.extend(internal_links)
                         else:
                             # Handle Links object
-                            self.state.pending_links.extend(result.links.internal + result.links.external)
+                            self.state.pending_links.extend(result.links.internal)
                     
                     # Update state
                     await self.strategy.update_state(self.state, [result])
@@ -1365,11 +1429,10 @@ class AdaptiveCrawler:
                                 if isinstance(result.links, dict):
                                     # Extract internal and external links from dict
                                     internal_links = [Link(**link_data) for link_data in result.links.get('internal', [])]
-                                    external_links = [Link(**link_data) for link_data in result.links.get('external', [])]
-                                    new_links = internal_links + external_links
+                                    new_links = internal_links
                                 else:
                                     # Handle Links object
-                                    new_links = result.links.internal + result.links.external
+                                    new_links = result.links.internal
                                 
                                 # Add new links to pending
                                 for new_link in new_links:
@@ -1417,7 +1480,7 @@ class AdaptiveCrawler:
                 include_external=False,
                 query=query,  # For BM25 scoring
                 concurrency=5,
-                timeout=5,
+                timeout=self.config.link_preview_timeout,
                 max_links=50,  # Reasonable limit
                 verbose=False
             ),
@@ -1780,7 +1843,7 @@ class AdaptiveCrawler:
         
         return export_dict
     
-    def import_knowledge_base(self, filepath: Union[str, Path], format: str = "jsonl") -> None:
+    async def import_knowledge_base(self, filepath: Union[str, Path], format: str = "jsonl") -> None:
         """Import a knowledge base from a file
         
         Args:
@@ -1809,7 +1872,7 @@ class AdaptiveCrawler:
             self.state.knowledge_base.extend(imported_results)
             
             # Update state with imported data
-            asyncio.run(self.strategy.update_state(self.state, imported_results))
+            await self.strategy.update_state(self.state, imported_results)
             
             print(f"Imported {len(imported_results)} documents from {filepath}")
         else:

@@ -1,4 +1,5 @@
-from pydantic import BaseModel, HttpUrl, PrivateAttr, Field
+from pydantic import BaseModel, HttpUrl, PrivateAttr, Field, ConfigDict, BeforeValidator
+from typing import Annotated
 from typing import List, Dict, Optional, Callable, Awaitable, Union, Any
 from typing import AsyncGenerator
 from typing import Generic, TypeVar
@@ -122,6 +123,7 @@ class MarkdownGenerationResult(BaseModel):
     references_markdown: str
     fit_markdown: Optional[str] = None
     fit_html: Optional[str] = None
+    _generation_failed: bool = PrivateAttr(default=False)
 
     def __str__(self):
         return self.raw_markdown
@@ -132,14 +134,22 @@ class CrawlResult(BaseModel):
     fit_html: Optional[str] = None
     success: bool
     cleaned_html: Optional[str] = None
-    media: Dict[str, List[Dict]] = {}
-    links: Dict[str, List[Dict]] = {}
+    # The keys a scraped page gets (arun moves media's "tables" to .tables), so
+    # a result built without them -- robots.txt refusal, a failed fetch --
+    # keeps the shape.
+    media: Dict[str, List[Dict]] = Field(
+        default_factory=lambda: {"images": [], "videos": [], "audios": []}
+    )
+    links: Dict[str, List[Dict]] = Field(
+        default_factory=lambda: {"internal": [], "external": []}
+    )
     downloaded_files: Optional[List[str]] = None
     js_execution_result: Optional[Dict[str, Any]] = None
     screenshot: Optional[str] = None
     pdf: Optional[bytes] = None
     mhtml: Optional[str] = None
     _markdown: Optional[MarkdownGenerationResult] = PrivateAttr(default=None)
+    _processing_failed: bool = PrivateAttr(default=False)
     extracted_content: Optional[str] = None
     metadata: Optional[dict] = None
     error_message: Optional[str] = None
@@ -149,12 +159,18 @@ class CrawlResult(BaseModel):
     ssl_certificate: Optional[SSLCertificate] = None
     dispatch_result: Optional[DispatchResult] = None
     redirected_url: Optional[str] = None
+    redirected_status_code: Optional[int] = None
     network_requests: Optional[List[Dict[str, Any]]] = None
     console_messages: Optional[List[Dict[str, Any]]] = None
     tables: List[Dict] = Field(default_factory=list)  # NEW – [{headers,rows,caption,summary}]
+    # Cache validation metadata (Smart Cache)
+    head_fingerprint: Optional[str] = None
+    cached_at: Optional[float] = None
+    cache_status: Optional[str] = None  # "hit", "hit_validated", "hit_fallback", "miss"
+    # Anti-bot retry/proxy usage stats
+    crawl_stats: Optional[Dict[str, Any]] = None
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 # NOTE: The StringCompatibleMarkdown class, custom __init__ method, property getters/setters,
 # and model_dump override all exist to support a smooth transition from markdown as a string
@@ -253,6 +269,16 @@ class CrawlResult(BaseModel):
         requirements change, this is where you would update the logic.
         """
         result = super().model_dump(*args, **kwargs)
+        
+        # Remove any property descriptors that might have been included
+        # These deprecated properties should not be in the serialized output
+        for key in ['fit_html', 'fit_markdown', 'markdown_v2']:
+            if key in result and isinstance(result[key], property):
+                # del result[key]
+                # Nasrin: I decided to convert it to string instead of removing it.
+                result[key] = str(result[key])
+        
+        # Add the markdown field properly
         if self._markdown is not None:
             result["markdown"] = self._markdown.model_dump() 
         return result
@@ -280,6 +306,10 @@ class CrawlResultContainer(Generic[CrawlResultT]):
 
     def __iter__(self):
         return iter(self._results)
+
+    async def __aiter__(self):
+        for item in self._results:
+            yield item
 
     def __getitem__(self, index):
         return self._results[index]
@@ -317,17 +347,27 @@ class AsyncCrawlResponse(BaseModel):
     mhtml_data: Optional[str] = None
     get_delayed_content: Optional[Callable[[Optional[float]], Awaitable[str]]] = None
     downloaded_files: Optional[List[str]] = None
+    placeholder_html: bool = False # True if html is a stand-in for the content, actual content is produced by the scraping strategy (eg. using PDFCrawlerStrategy)
     ssl_certificate: Optional[SSLCertificate] = None
     redirected_url: Optional[str] = None
+    redirected_status_code: Optional[int] = None
     network_requests: Optional[List[Dict[str, Any]]] = None
     console_messages: Optional[List[Dict[str, Any]]] = None
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 ###############################
 # Scraping Models
 ###############################
+def _coerce_int(v):
+    """Coerce to int or return None for non-numeric values like '100%' or 'auto'."""
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return None
+
 class MediaItem(BaseModel):
     src: Optional[str] = ""
     data: Optional[str] = ""
@@ -337,7 +377,7 @@ class MediaItem(BaseModel):
     type: str = "image"
     group_id: Optional[int] = 0
     format: Optional[str] = None
-    width: Optional[int] = None
+    width: Annotated[Optional[int], BeforeValidator(_coerce_int)] = None
 
 
 class Link(BaseModel):

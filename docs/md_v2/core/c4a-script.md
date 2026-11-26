@@ -69,12 +69,12 @@ The tutorial includes a Flask-based web interface with:
 cd docs/examples/c4a_script/tutorial/
 
 # Install dependencies
-pip install flask
+pip install -r requirements.txt
 
 # Launch the tutorial server
-python app.py
+python server.py
 
-# Open http://localhost:5000 in your browser
+# Open http://localhost:8000 in your browser
 ```
 
 ## Core Concepts
@@ -111,8 +111,8 @@ CLICK `.submit-btn`
 # By attribute
 CLICK `button[type="submit"]`
 
-# By text content
-CLICK `button:contains("Sign In")`
+# By accessible attributes
+CLICK `button[aria-label="Search"][title="Search"]`
 
 # Complex selectors
 CLICK `.form-container input[name="email"]`
@@ -275,7 +275,7 @@ C4A-Script includes a powerful visual programming interface built on Google Bloc
 - **Error Prevention**: Visual connections prevent syntax errors
 - **Comment Support**: Add visual comment blocks for documentation
 
-Try the visual editor in our [live demo](https://docs.crawl4ai.com/c4a-script/demo) or [local tutorial](/examples/c4a_script/tutorial/).
+Try the visual editor in our [live demo](https://docs.crawl4ai.com/apps/c4a-script/) or [local tutorial](https://github.com/unclecode/crawl4ai/tree/main/docs/examples/c4a_script/tutorial).
 
 ## Advanced Features
 
@@ -375,18 +375,18 @@ SET `#email` $test_email
 
 ## Getting Help
 
-- **📖 [Complete Examples](/examples/c4a_script/)** - Real-world automation scripts
-- **🎮 [Interactive Tutorial](/examples/c4a_script/tutorial/)** - Hands-on learning environment  
+- **📖 [Complete Examples](https://github.com/unclecode/crawl4ai/tree/main/docs/examples/c4a_script)** - Real-world automation scripts
+- **🎮 [Interactive Tutorial](https://github.com/unclecode/crawl4ai/tree/main/docs/examples/c4a_script/tutorial)** - Hands-on learning environment  
 - **📋 [API Reference](/api/c4a-script-reference/)** - Detailed command documentation
-- **🌐 [Live Demo](https://docs.crawl4ai.com/c4a-script/demo)** - Try it in your browser
+- **🌐 [Live Demo](https://docs.crawl4ai.com/apps/c4a-script/)** - Try it in your browser
 
 ## What's Next?
 
 Ready to dive deeper? Check out:
 
 1. **[API Reference](/api/c4a-script-reference/)** - Complete command documentation
-2. **[Tutorial Examples](/examples/c4a_script/)** - Copy-paste ready scripts
-3. **[Local Tutorial Setup](/examples/c4a_script/tutorial/)** - Run the full development environment
+2. **[Tutorial Examples](https://github.com/unclecode/crawl4ai/tree/main/docs/examples/c4a_script)** - Copy-paste ready scripts
+3. **[Local Tutorial Setup](https://github.com/unclecode/crawl4ai/tree/main/docs/examples/c4a_script/tutorial)** - Run the full development environment
 
 C4A-Script makes web automation accessible to everyone. Whether you're a developer automating tests, a designer creating interactive demos, or a business user streamlining repetitive tasks, C4A-Script has the tools you need.
 

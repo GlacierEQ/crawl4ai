@@ -2241,7 +2241,7 @@ docker build -t crawl4ai
 
 | Argument | Description | Default | Options |
 |----------|-------------|---------|----------|
-| PYTHON_VERSION | Python version | 3.10 | 3.8, 3.9, 3.10 |
+| PYTHON_VERSION | Python version | 3.10 | 3.10, 3.11, 3.12, 3.13 |
 | INSTALL_TYPE | Feature set | default | default, all, torch, transformer |
 | ENABLE_GPU | GPU support | false | true, false |
 | APP_HOME | Install path | /app | any valid path |
@@ -2922,7 +2922,7 @@ We're here to help you succeed with Crawl4AI! Here's how to get support:
 
 - 📖 Check our [full documentation](https://docs.crawl4ai.com)
 - 🐛 Found a bug? [Open an issue](https://github.com/unclecode/crawl4ai/issues)
-- 💬 Join our [Discord community](https://discord.gg/crawl4ai)
+- 💬 Join our [Discord community](https://discord.gg/jP8KfhDhyN)
 - ⭐ Star us on GitHub to show support!
 
 ## Summary
@@ -3296,16 +3296,18 @@ This step caches large models locally (if needed). **Only do this** if your wo
 
 ---
 
-## 5. Docker (Experimental)
+## 5. Docker
 
-We provide a **temporary** Docker approach for testing. **It’s not stable and may break** with future releases. We plan a major Docker revamp in a future stable version, 2025 Q1. If you still want to try:
+The Docker server needs a token. Without one it answers only inside its container.
 
 ```bash
-docker pull unclecode/crawl4ai:basic
-docker run -p 11235:11235 unclecode/crawl4ai:basic
+export CRAWL4AI_API_TOKEN="$(openssl rand -hex 32)"
+docker run -d -p 11235:11235 --name crawl4ai --shm-size=1g \
+  -e CRAWL4AI_API_TOKEN="$CRAWL4AI_API_TOKEN" \
+  unclecode/crawl4ai:latest
 ```
 
-You can then make POST requests to `http://localhost:11235/crawl` to perform crawls. **Production usage** is discouraged until our new Docker approach is ready (planned in Jan or Feb 2025).
+Send the token with every request (`Authorization: Bearer $CRAWL4AI_API_TOKEN`). For LLM keys, MCP and all settings, see the [Self-hosting guide](https://docs.crawl4ai.com/core/self-hosting/).
 
 ---
 
@@ -8589,7 +8591,7 @@ Real sites often have **nested** or repeated data—like categories containing p
 
 We have a **sample e-commerce** HTML file on GitHub (example):
 ```
-https://gist.githubusercontent.com/githubusercontent/2d7b8ba3cd8ab6cf3c8da771ddb36878/raw/1ae2f90c6861ce7dd84cc50d3df9920dee5e1fd2/sample_ecommerce.html
+https://raw.githubusercontent.com/unclecode/crawl4ai/main/docs/examples/sample_ecommerce.html
 ```
 This snippet includes categories, products, features, reviews, and related items. Let’s see how to define a schema that fully captures that structure **without LLM**.
 
@@ -8721,7 +8723,7 @@ async def extract_ecommerce_data():
     
     async with AsyncWebCrawler(verbose=True) as crawler:
         result = await crawler.arun(
-            url="https://gist.githubusercontent.com/githubusercontent/2d7b8ba3cd8ab6cf3c8da771ddb36878/raw/1ae2f90c6861ce7dd84cc50d3df9920dee5e1fd2/sample_ecommerce.html",
+            url="https://raw.githubusercontent.com/unclecode/crawl4ai/main/docs/examples/sample_ecommerce.html",
             extraction_strategy=strategy,
             config=config
         )

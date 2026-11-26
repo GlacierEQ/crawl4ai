@@ -2,7 +2,7 @@
 import asyncio
 import logging
 from datetime import datetime
-from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple
+from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple, Any, Callable, Awaitable, Union
 from urllib.parse import urlparse
 
 from ..models import TraversalStats
@@ -10,12 +10,18 @@ from .filters import FilterChain
 from .scorers import URLScorer
 from . import DeepCrawlStrategy
 
-from ..types import AsyncWebCrawler, CrawlerRunConfig, CrawlResult, RunManyReturn
+from ..types import (
+    AsyncWebCrawler,
+    BaseDispatcher,
+    CrawlerRunConfig,
+    CrawlResult,
+    RunManyReturn,
+)
 from ..utils import normalize_url_for_deep_crawl
 
 from math import inf as infinity
 
-# Configurable batch size for processing items from the priority queue
+# Default batch size for processing items from the priority queue
 BATCH_SIZE = 10
 
 
@@ -39,18 +45,45 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
         filter_chain: FilterChain = FilterChain(),
         url_scorer: Optional[URLScorer] = None,
         include_external: bool = False,
+        score_threshold: float = -infinity,
         max_pages: int = infinity,
         logger: Optional[logging.Logger] = None,
+        # Optional resume/callback parameters for crash recovery
+        resume_state: Optional[Dict[str, Any]] = None,
+        on_state_change: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        # Optional cancellation callback - checked before each URL is processed
+        should_cancel: Optional[Callable[[], Union[bool, Awaitable[bool]]]] = None,
+        # Number of items pulled from the priority queue per round and handed
+        # to arun_many() at once. Defaults to 10.
+        batch_size: int = BATCH_SIZE,
+        # Optional dispatcher forwarded to arun_many() for each batch
+        dispatcher: Optional[BaseDispatcher] = None,
     ):
         self.max_depth = max_depth
         self.filter_chain = filter_chain
         self.url_scorer = url_scorer
         self.include_external = include_external
+        self.score_threshold = score_threshold
         self.max_pages = max_pages
-        self.logger = logger or logging.getLogger(__name__)
+        self.batch_size = batch_size
+        self.dispatcher = dispatcher
+        # self.logger = logger or logging.getLogger(__name__)
+        # Ensure logger is always a Logger instance, not a dict from serialization
+        if isinstance(logger, logging.Logger):
+            self.logger = logger
+        else:
+            # Create a new logger if logger is None, dict, or any other non-Logger type
+            self.logger = logging.getLogger(__name__)
         self.stats = TraversalStats(start_time=datetime.now())
         self._cancel_event = asyncio.Event()
         self._pages_crawled = 0
+        # Store for use in arun methods
+        self._resume_state = resume_state
+        self._on_state_change = on_state_change
+        self._should_cancel = should_cancel
+        self._last_state: Optional[Dict[str, Any]] = None
+        # Shadow list for queue items (only used when on_state_change is set)
+        self._queue_shadow: Optional[List[Tuple[float, int, str, Optional[str]]]] = None
 
     async def can_process_url(self, url: str, depth: int) -> bool:
         """
@@ -73,6 +106,55 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
             return False
 
         return True
+
+    def cancel(self) -> None:
+        """
+        Cancel the crawl. Thread-safe, can be called from any context.
+
+        The crawl will stop before processing the next URL. The current URL
+        being processed (if any) will complete before the crawl stops.
+        """
+        self._cancel_event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        """
+        Check if the crawl was/is cancelled. Thread-safe.
+
+        Returns:
+            True if the crawl has been cancelled, False otherwise.
+        """
+        return self._cancel_event.is_set()
+
+    async def _check_cancellation(self) -> bool:
+        """
+        Check if crawl should be cancelled.
+
+        Handles both internal cancel flag and external should_cancel callback.
+        Supports both sync and async callbacks.
+
+        Returns:
+            True if crawl should be cancelled, False otherwise.
+        """
+        if self._cancel_event.is_set():
+            return True
+
+        if self._should_cancel:
+            try:
+                # Handle both sync and async callbacks
+                result = self._should_cancel()
+                if asyncio.iscoroutine(result):
+                    result = await result
+
+                if result:
+                    self._cancel_event.set()
+                    self.stats.end_time = datetime.now()
+                    return True
+            except Exception as e:
+                # Fail-open: log warning and continue crawling
+                self.logger.warning(f"should_cancel callback error: {e}")
+
+        return False
 
     async def link_discovery(
         self,
@@ -110,16 +192,18 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
             base_url = normalize_url_for_deep_crawl(url, source_url)
             if base_url in visited:
                 continue
-            if not await self.can_process_url(url, new_depth):
+            # Already queued at an equal or shallower depth: a second entry would
+            # be scored and dropped for nothing. A strictly shallower find still
+            # has to re-queue, so the URL is crawled at its true distance from the
+            # start and its own children stay inside max_depth.
+            queued_depth = depths.get(base_url)
+            if queued_depth is not None and queued_depth <= new_depth:
+                continue
+            if not await self.can_process_url(base_url, new_depth):
                 self.stats.urls_skipped += 1
                 continue
                 
             valid_links.append(base_url)
-            
-        # If we have more valid links than capacity, limit them
-        if len(valid_links) > remaining_capacity:
-            valid_links = valid_links[:remaining_capacity]
-            self.logger.info(f"Limiting to {remaining_capacity} URLs due to max_pages limit")
             
         # Record the new depths and add to next_links
         for url in valid_links:
@@ -134,36 +218,73 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
     ) -> AsyncGenerator[CrawlResult, None]:
         """
         Core best-first crawl method using a priority queue.
-        
+
         The queue items are tuples of (score, depth, url, parent_url). Lower scores
         are treated as higher priority. URLs are processed in batches for efficiency.
         """
+        # Reset cancel event for strategy reuse
+        self._cancel_event = asyncio.Event()
+
         queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
-        # Push the initial URL with score 0 and depth 0.
-        await queue.put((0, 0, start_url, None))
-        visited: Set[str] = set()
-        depths: Dict[str, int] = {start_url: 0}
+
+        # Conditional state initialization for resume support
+        if self._resume_state:
+            visited = set(self._resume_state.get("visited", []))
+            depths = dict(self._resume_state.get("depths", {}))
+            self._pages_crawled = self._resume_state.get("pages_crawled", 0)
+            # Restore queue from saved items
+            queue_items = self._resume_state.get("queue_items", [])
+            for item in queue_items:
+                await queue.put((item["score"], item["depth"], item["url"], item["parent_url"]))
+            # Initialize shadow list if callback is set
+            if self._on_state_change:
+                self._queue_shadow = [
+                    (item["score"], item["depth"], item["url"], item["parent_url"])
+                    for item in queue_items
+                ]
+        else:
+            # Original initialization
+            initial_score = self.url_scorer.score(start_url) if self.url_scorer else 0
+            await queue.put((-initial_score, 0, start_url, None))
+            visited: Set[str] = set()
+            depths: Dict[str, int] = {start_url: 0}
+            self._pages_crawled = 0
+            # Initialize shadow list if callback is set
+            if self._on_state_change:
+                self._queue_shadow = [(-initial_score, 0, start_url, None)]
 
         while not queue.empty() and not self._cancel_event.is_set():
             # Stop if we've reached the max pages limit
             if self._pages_crawled >= self.max_pages:
                 self.logger.info(f"Max pages limit ({self.max_pages}) reached, stopping crawl")
                 break
-                
+
+            # Check external cancellation callback before processing this batch
+            if await self._check_cancellation():
+                self.logger.info("Crawl cancelled by user")
+                break
+
             # Calculate how many more URLs we can process in this batch
             remaining = self.max_pages - self._pages_crawled
-            batch_size = min(BATCH_SIZE, remaining)
-            if batch_size <= 0:
+            effective_batch_size = min(self.batch_size, remaining)
+            if effective_batch_size <= 0:
                 # No more pages to crawl
                 self.logger.info(f"Max pages limit ({self.max_pages}) reached, stopping crawl")
                 break
-                
+
             batch: List[Tuple[float, int, str, Optional[str]]] = []
-            # Retrieve up to BATCH_SIZE items from the priority queue.
-            for _ in range(BATCH_SIZE):
+            # Retrieve up to effective_batch_size items from the priority queue,
+            # so the final round never fetches past the max_pages budget.
+            for _ in range(effective_batch_size):
                 if queue.empty():
                     break
                 item = await queue.get()
+                # Remove from shadow list if tracking
+                if self._on_state_change and self._queue_shadow is not None:
+                    try:
+                        self._queue_shadow.remove(item)
+                    except ValueError:
+                        pass  # Item may have been removed already
                 score, depth, url, parent_url = item
                 if url in visited:
                     continue
@@ -173,44 +294,98 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
             if not batch:
                 continue
 
-            # Process the current batch of URLs.
+            # Process the current batch of URLs concurrently, but process the
+            # results in the original priority-queue order. arun_many streams
+            # results as requests finish, so discovering links immediately can
+            # make subsequent queue ordering depend on network timing.
             urls = [item[2] for item in batch]
             batch_config = config.clone(deep_crawl_strategy=None, stream=True)
-            stream_gen = await crawler.arun_many(urls=urls, config=batch_config)
+            arun_many_kwargs = (
+                {"dispatcher": self.dispatcher} if self.dispatcher is not None else {}
+            )
+            stream_gen = await crawler.arun_many(
+                urls=urls, config=batch_config, **arun_many_kwargs
+            )
+            results_by_url: Dict[str, CrawlResult] = {}
             async for result in stream_gen:
-                result_url = result.url
-                # Find the corresponding tuple from the batch.
-                corresponding = next((item for item in batch if item[2] == result_url), None)
-                if not corresponding:
+                results_by_url[result.url] = result
+
+            for score, depth, url, parent_url in batch:
+                result = results_by_url.get(url)
+                if result is None:
                     continue
-                score, depth, url, parent_url = corresponding
                 result.metadata = result.metadata or {}
                 result.metadata["depth"] = depth
                 result.metadata["parent_url"] = parent_url
-                result.metadata["score"] = score
+                result.metadata["score"] = -score
                 
                 # Count only successful crawls toward max_pages limit
                 if result.success:
                     self._pages_crawled += 1
-                    # Check if we've reached the limit during batch processing
-                    if self._pages_crawled >= self.max_pages:
-                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
-                        break  # Exit the generator
-                
+
+                # Yield the result before any limit check so the boundary page is
+                # kept (mirrors BFS/DFS, which append the result before breaking).
                 yield result
-                
+
+                # Stop once the limit is reached, but only after yielding the
+                # successful boundary page above.
+                if result.success and self._pages_crawled >= self.max_pages:
+                    self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
+                    break  # Exit the generator
+
                 # Only discover links from successful crawls
                 if result.success:
                     # Discover new links from this result
                     new_links: List[Tuple[str, Optional[str]]] = []
-                    await self.link_discovery(result, result_url, depth, visited, new_links, depths)
+                    await self.link_discovery(result, url, depth, visited, new_links, depths)
                     
                     for new_url, new_parent in new_links:
                         new_depth = depths.get(new_url, depth + 1)
                         new_score = self.url_scorer.score(new_url) if self.url_scorer else 0
-                        await queue.put((new_score, new_depth, new_url, new_parent))
+                        # Skip URLs with scores below the threshold
+                        if new_score < self.score_threshold:
+                            self.logger.debug(
+                                f"URL {new_url} skipped: score {new_score} below threshold {self.score_threshold}"
+                            )
+                            self.stats.urls_skipped += 1
+                            continue
+                        queue_item = (-new_score, new_depth, new_url, new_parent)
+                        await queue.put(queue_item)
+                        # Add to shadow list if tracking
+                        if self._on_state_change and self._queue_shadow is not None:
+                            self._queue_shadow.append(queue_item)
 
-        # End of crawl.
+                    # Capture state after EACH URL processed (if callback set)
+                    if self._on_state_change and self._queue_shadow is not None:
+                        state = {
+                            "strategy_type": "best_first",
+                            "visited": list(visited),
+                            "queue_items": [
+                                {"score": s, "depth": d, "url": u, "parent_url": p}
+                                for s, d, u, p in self._queue_shadow
+                            ],
+                            "depths": depths,
+                            "pages_crawled": self._pages_crawled,
+                            "cancelled": self._cancel_event.is_set(),
+                        }
+                        self._last_state = state
+                        await self._on_state_change(state)
+
+        # Final state update if cancelled
+        if self._cancel_event.is_set() and self._on_state_change and self._queue_shadow is not None:
+            state = {
+                "strategy_type": "best_first",
+                "visited": list(visited),
+                "queue_items": [
+                    {"score": s, "depth": d, "url": u, "parent_url": p}
+                    for s, d, u, p in self._queue_shadow
+                ],
+                "depths": depths,
+                "pages_crawled": self._pages_crawled,
+                "cancelled": True,
+            }
+            self._last_state = state
+            await self._on_state_change(state)
 
     async def _arun_batch(
         self,
@@ -267,3 +442,15 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
         """
         self._cancel_event.set()
         self.stats.end_time = datetime.now()
+
+    def export_state(self) -> Optional[Dict[str, Any]]:
+        """
+        Export current crawl state for external persistence.
+
+        Note: This returns the last captured state. For real-time state,
+        use the on_state_change callback.
+
+        Returns:
+            Dict with strategy state, or None if no state captured yet.
+        """
+        return self._last_state

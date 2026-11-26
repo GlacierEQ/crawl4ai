@@ -2,14 +2,14 @@
 import asyncio
 import logging
 from datetime import datetime
-from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple
+from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple, Any, Callable, Awaitable, Union
 from urllib.parse import urlparse
 
 from ..models import TraversalStats
 from .filters import FilterChain
 from .scorers import URLScorer
-from . import DeepCrawlStrategy  
-from ..types import AsyncWebCrawler, CrawlerRunConfig, CrawlResult
+from . import DeepCrawlStrategy
+from ..types import AsyncWebCrawler, BaseDispatcher, CrawlerRunConfig, CrawlResult
 from ..utils import normalize_url_for_deep_crawl, efficient_normalize_url_for_deep_crawl
 from math import inf as infinity
 
@@ -26,11 +26,18 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         self,
         max_depth: int,
         filter_chain: FilterChain = FilterChain(),
-        url_scorer: Optional[URLScorer] = None,        
+        url_scorer: Optional[URLScorer] = None,
         include_external: bool = False,
         score_threshold: float = -infinity,
         max_pages: int = infinity,
         logger: Optional[logging.Logger] = None,
+        # Optional resume/callback parameters for crash recovery
+        resume_state: Optional[Dict[str, Any]] = None,
+        on_state_change: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        # Optional cancellation callback - checked before each URL is processed
+        should_cancel: Optional[Callable[[], Union[bool, Awaitable[bool]]]] = None,
+        # Optional dispatcher forwarded to arun_many() for each level
+        dispatcher: Optional[BaseDispatcher] = None,
     ):
         self.max_depth = max_depth
         self.filter_chain = filter_chain
@@ -38,10 +45,22 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         self.include_external = include_external
         self.score_threshold = score_threshold
         self.max_pages = max_pages
-        self.logger = logger or logging.getLogger(__name__)
+        self.dispatcher = dispatcher
+        # self.logger = logger or logging.getLogger(__name__)
+        # Ensure logger is always a Logger instance, not a dict from serialization
+        if isinstance(logger, logging.Logger):
+            self.logger = logger
+        else:
+            # Create a new logger if logger is None, dict, or any other non-Logger type
+            self.logger = logging.getLogger(__name__)
         self.stats = TraversalStats(start_time=datetime.now())
         self._cancel_event = asyncio.Event()
         self._pages_crawled = 0
+        # Store for use in arun methods
+        self._resume_state = resume_state
+        self._on_state_change = on_state_change
+        self._should_cancel = should_cancel
+        self._last_state: Optional[Dict[str, Any]] = None
 
     async def can_process_url(self, url: str, depth: int) -> bool:
         """
@@ -65,6 +84,55 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
 
         return True
 
+    def cancel(self) -> None:
+        """
+        Cancel the crawl. Thread-safe, can be called from any context.
+
+        The crawl will stop before processing the next URL. The current URL
+        being processed (if any) will complete before the crawl stops.
+        """
+        self._cancel_event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        """
+        Check if the crawl was/is cancelled. Thread-safe.
+
+        Returns:
+            True if the crawl has been cancelled, False otherwise.
+        """
+        return self._cancel_event.is_set()
+
+    async def _check_cancellation(self) -> bool:
+        """
+        Check if crawl should be cancelled.
+
+        Handles both internal cancel flag and external should_cancel callback.
+        Supports both sync and async callbacks.
+
+        Returns:
+            True if crawl should be cancelled, False otherwise.
+        """
+        if self._cancel_event.is_set():
+            return True
+
+        if self._should_cancel:
+            try:
+                # Handle both sync and async callbacks
+                result = self._should_cancel()
+                if asyncio.iscoroutine(result):
+                    result = await result
+
+                if result:
+                    self._cancel_event.set()
+                    self.stats.end_time = datetime.now()
+                    return True
+            except Exception as e:
+                # Fail-open: log warning and continue crawling
+                self.logger.warning(f"should_cancel callback error: {e}")
+
+        return False
+
     async def link_discovery(
         self,
         result: CrawlResult,
@@ -85,7 +153,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             return
 
         # If we've reached the max pages limit, don't discover new links
-        remaining_capacity = self.max_pages - self._pages_crawled
+        remaining_capacity = self.max_pages - self._pages_crawled - len(next_level)
         if remaining_capacity <= 0:
             self.logger.info(f"Max pages limit ({self.max_pages}) reached, stopping link discovery")
             return
@@ -105,7 +173,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             base_url = normalize_url_for_deep_crawl(url, source_url)
             if base_url in visited:
                 continue
-            if not await self.can_process_url(url, next_depth):
+            if not await self.can_process_url(base_url, next_depth):
                 self.stats.urls_skipped += 1
                 continue
 
@@ -149,10 +217,25 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         Batch (non-streaming) mode:
         Processes one BFS level at a time, then yields all the results.
         """
-        visited: Set[str] = set()
-        # current_level holds tuples: (url, parent_url)
-        current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
-        depths: Dict[str, int] = {start_url: 0}
+        # Reset cancel event for strategy reuse
+        self._cancel_event = asyncio.Event()
+
+        # Conditional state initialization for resume support
+        if self._resume_state:
+            visited = set(self._resume_state.get("visited", []))
+            current_level = [
+                (item["url"], item["parent_url"])
+                for item in self._resume_state.get("pending", [])
+            ]
+            depths = dict(self._resume_state.get("depths", {}))
+            self._pages_crawled = self._resume_state.get("pages_crawled", 0)
+        else:
+            # Original initialization
+            visited: Set[str] = set()
+            # current_level holds tuples: (url, parent_url)
+            current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
+            depths: Dict[str, int] = {start_url: 0}
+            self._pages_crawled = 0
 
         results: List[CrawlResult] = []
 
@@ -161,33 +244,79 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             if self._pages_crawled >= self.max_pages:
                 self.logger.info(f"Max pages limit ({self.max_pages}) reached, stopping crawl")
                 break
-            
+
+            # Check external cancellation callback before processing this level
+            if await self._check_cancellation():
+                self.logger.info("Crawl cancelled by user")
+                break
+
             next_level: List[Tuple[str, Optional[str]]] = []
+            # Siblings in a level queue links before the level's own pages are all
+            # counted, so cap the level to the budget left before fetching it.
+            # max_pages defaults to infinity, which is not a valid slice index.
+            remaining = self.max_pages - self._pages_crawled
+            if remaining < len(current_level):
+                current_level = current_level[:max(int(remaining), 0)]
             urls = [url for url, _ in current_level]
+            # reversed() keeps first-parent-wins if a resumed level repeats a URL
+            parents = dict(reversed(current_level))
 
             # Clone the config to disable deep crawling recursion and enforce batch mode.
             batch_config = config.clone(deep_crawl_strategy=None, stream=False)
-            batch_results = await crawler.arun_many(urls=urls, config=batch_config)
-            
-            # Update pages crawled counter - count only successful crawls
-            successful_results = [r for r in batch_results if r.success]
-            self._pages_crawled += len(successful_results)
-            
+            # Only pass `dispatcher` when explicitly set, so the call shape is
+            # unchanged (and test doubles built against the old signature keep
+            # working) for the common case of relying on arun_many()'s own default.
+            arun_many_kwargs = (
+                {"dispatcher": self.dispatcher} if self.dispatcher is not None else {}
+            )
+            batch_results = await crawler.arun_many(
+                urls=urls, config=batch_config, **arun_many_kwargs
+            )
+
             for result in batch_results:
                 url = result.url
                 depth = depths.get(url, 0)
                 result.metadata = result.metadata or {}
                 result.metadata["depth"] = depth
-                parent_url = next((parent for (u, parent) in current_level if u == url), None)
+                parent_url = parents.get(url)
                 result.metadata["parent_url"] = parent_url
                 results.append(result)
-                
+
                 # Only discover links from successful crawls
                 if result.success:
+                    # Increment pages crawled per URL for accurate state tracking
+                    self._pages_crawled += 1
+
                     # Link discovery will handle the max pages limit internally
                     await self.link_discovery(result, url, depth, visited, next_level, depths)
 
+                    # Capture state after EACH URL processed (if callback set)
+                    if self._on_state_change:
+                        state = {
+                            "strategy_type": "bfs",
+                            "visited": list(visited),
+                            "pending": [{"url": u, "parent_url": p} for u, p in next_level],
+                            "depths": depths,
+                            "pages_crawled": self._pages_crawled,
+                            "cancelled": self._cancel_event.is_set(),
+                        }
+                        self._last_state = state
+                        await self._on_state_change(state)
+
             current_level = next_level
+
+        # Final state update if cancelled
+        if self._cancel_event.is_set() and self._on_state_change:
+            state = {
+                "strategy_type": "bfs",
+                "visited": list(visited),
+                "pending": [{"url": u, "parent_url": p} for u, p in current_level],
+                "depths": depths,
+                "pages_crawled": self._pages_crawled,
+                "cancelled": True,
+            }
+            self._last_state = state
+            await self._on_state_change(state)
 
         return results
 
@@ -201,18 +330,54 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         Streaming mode:
         Processes one BFS level at a time and yields results immediately as they arrive.
         """
-        visited: Set[str] = set()
-        current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
-        depths: Dict[str, int] = {start_url: 0}
+        # Reset cancel event for strategy reuse
+        self._cancel_event = asyncio.Event()
+
+        # Conditional state initialization for resume support
+        if self._resume_state:
+            visited = set(self._resume_state.get("visited", []))
+            current_level = [
+                (item["url"], item["parent_url"])
+                for item in self._resume_state.get("pending", [])
+            ]
+            depths = dict(self._resume_state.get("depths", {}))
+            self._pages_crawled = self._resume_state.get("pages_crawled", 0)
+        else:
+            # Original initialization
+            visited: Set[str] = set()
+            current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
+            depths: Dict[str, int] = {start_url: 0}
+            self._pages_crawled = 0
 
         while current_level and not self._cancel_event.is_set():
+            # Check external cancellation callback before processing this level
+            if await self._check_cancellation():
+                self.logger.info("Crawl cancelled by user")
+                break
+
             next_level: List[Tuple[str, Optional[str]]] = []
+            # Siblings in a level queue links before the level's own pages are all
+            # counted, so cap the level to the budget left before fetching it.
+            # max_pages defaults to infinity, which is not a valid slice index.
+            remaining = self.max_pages - self._pages_crawled
+            if remaining < len(current_level):
+                current_level = current_level[:max(int(remaining), 0)]
+            if not current_level:
+                self.logger.info(f"Max pages limit ({self.max_pages}) reached, stopping crawl")
+                break
             urls = [url for url, _ in current_level]
+            # reversed() keeps first-parent-wins if a resumed level repeats a URL
+            parents = dict(reversed(current_level))
             visited.update(urls)
 
             stream_config = config.clone(deep_crawl_strategy=None, stream=True)
-            stream_gen = await crawler.arun_many(urls=urls, config=stream_config)
-            
+            arun_many_kwargs = (
+                {"dispatcher": self.dispatcher} if self.dispatcher is not None else {}
+            )
+            stream_gen = await crawler.arun_many(
+                urls=urls, config=stream_config, **arun_many_kwargs
+            )
+
             # Keep track of processed results for this batch
             results_count = 0
             async for result in stream_gen:
@@ -220,7 +385,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 depth = depths.get(url, 0)
                 result.metadata = result.metadata or {}
                 result.metadata["depth"] = depth
-                parent_url = next((parent for (u, parent) in current_level if u == url), None)
+                parent_url = parents.get(url)
                 result.metadata["parent_url"] = parent_url
                 
                 # Count only successful crawls
@@ -238,13 +403,39 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 if result.success:
                     # Link discovery will handle the max pages limit internally
                     await self.link_discovery(result, url, depth, visited, next_level, depths)
-            
+
+                    # Capture state after EACH URL processed (if callback set)
+                    if self._on_state_change:
+                        state = {
+                            "strategy_type": "bfs",
+                            "visited": list(visited),
+                            "pending": [{"url": u, "parent_url": p} for u, p in next_level],
+                            "depths": depths,
+                            "pages_crawled": self._pages_crawled,
+                            "cancelled": self._cancel_event.is_set(),
+                        }
+                        self._last_state = state
+                        await self._on_state_change(state)
+
             # If we didn't get results back (e.g. due to errors), avoid getting stuck in an infinite loop
             # by considering these URLs as visited but not counting them toward the max_pages limit
             if results_count == 0 and urls:
                 self.logger.warning(f"No results returned for {len(urls)} URLs, marking as visited")
-                
+
             current_level = next_level
+
+        # Final state update if cancelled
+        if self._cancel_event.is_set() and self._on_state_change:
+            state = {
+                "strategy_type": "bfs",
+                "visited": list(visited),
+                "pending": [{"url": u, "parent_url": p} for u, p in current_level],
+                "depths": depths,
+                "pages_crawled": self._pages_crawled,
+                "cancelled": True,
+            }
+            self._last_state = state
+            await self._on_state_change(state)
 
     async def shutdown(self) -> None:
         """
@@ -252,3 +443,15 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         """
         self._cancel_event.set()
         self.stats.end_time = datetime.now()
+
+    def export_state(self) -> Optional[Dict[str, Any]]:
+        """
+        Export current crawl state for external persistence.
+
+        Note: This returns the last captured state. For real-time state,
+        use the on_state_change callback.
+
+        Returns:
+            Dict with strategy state, or None if no state captured yet.
+        """
+        return self._last_state

@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env file
 
 # Default provider, ONLY used when the extraction strategy is LLMExtractionStrategy
-DEFAULT_PROVIDER = "openai/gpt-4o"
+DEFAULT_PROVIDER = "openai/gpt-6-luna"
 DEFAULT_PROVIDER_API_KEY = "OPENAI_API_KEY"
 MODEL_REPO_BRANCH = "new-release-0.0.2"
 # Provider-model dictionary, ONLY used when the extraction strategy is LLMExtractionStrategy
@@ -14,10 +14,7 @@ PROVIDER_MODELS = {
     "groq/llama3-8b-8192": os.getenv("GROQ_API_KEY"),
     "openai/gpt-4o-mini": os.getenv("OPENAI_API_KEY"),
     "openai/gpt-4o": os.getenv("OPENAI_API_KEY"),
-    "openai/o1-mini": os.getenv("OPENAI_API_KEY"),
-    "openai/o1-preview": os.getenv("OPENAI_API_KEY"),
-    "openai/o3-mini": os.getenv("OPENAI_API_KEY"),
-    "openai/o3-mini-high": os.getenv("OPENAI_API_KEY"),
+    "openai/gpt-6-luna": os.getenv("OPENAI_API_KEY"),
     "anthropic/claude-3-haiku-20240307": os.getenv("ANTHROPIC_API_KEY"),
     "anthropic/claude-3-opus-20240229": os.getenv("ANTHROPIC_API_KEY"),
     "anthropic/claude-3-sonnet-20240229": os.getenv("ANTHROPIC_API_KEY"),
@@ -36,6 +33,7 @@ PROVIDER_MODELS_PREFIXES = {
     "anthropic": os.getenv("ANTHROPIC_API_KEY"),
     "gemini": os.getenv("GEMINI_API_KEY"),
     "deepseek": os.getenv("DEEPSEEK_API_KEY"),
+    "bedrock": None,  # Bedrock uses AWS credential chain (SigV4) or explicit api_token for bearer auth
 }
 
 # Chunk token threshold
@@ -47,7 +45,7 @@ WORD_TOKEN_RATE = 1.3
 MIN_WORD_THRESHOLD = 1
 IMAGE_DESCRIPTION_MIN_WORD_THRESHOLD = 1
 
-IMPORTANT_ATTRS = ["src", "href", "alt", "title", "width", "height"]
+IMPORTANT_ATTRS = ["src", "href", "alt", "title", "width", "height", "class", "id", "rowspan", "colspan"]
 ONLY_TEXT_ELIGIBLE_TAGS = [
     "b",
     "i",
@@ -102,11 +100,14 @@ SCREENSHOT_HEIGHT_TRESHOLD = 10000
 PAGE_TIMEOUT = 60000
 DOWNLOAD_PAGE_TIMEOUT = 60000
 
+# Delimiter for concatenating multiple HTML examples in schema generation
+HTML_EXAMPLE_DELIMITER = "=== HTML EXAMPLE {index} ==="
+
 # Global user settings with descriptions and default values
 USER_SETTINGS = {
     "DEFAULT_LLM_PROVIDER": {
-        "default": "openai/gpt-4o",
-        "description": "Default LLM provider in 'company/model' format (e.g., 'openai/gpt-4o', 'anthropic/claude-3-sonnet')",
+        "default": DEFAULT_PROVIDER,
+        "description": "Default LLM provider in 'company/model' format (e.g., 'openai/gpt-6-luna', 'anthropic/claude-3-sonnet')",
         "type": "string"
     },
     "DEFAULT_LLM_PROVIDER_TOKEN": {
@@ -142,5 +143,10 @@ USER_SETTINGS = {
         "description": "Default user agent mode (default, random, or mobile)",
         "type": "string",
         "options": ["default", "random", "mobile"]
+    },
+    "JSON_ENSURE_ASCII": {
+        "default": True,
+        "description": "Whether to escape non-ASCII characters in JSON output (False preserves Unicode like 'š', True escapes as '\\u0161')",
+        "type": "boolean"
     }
 }

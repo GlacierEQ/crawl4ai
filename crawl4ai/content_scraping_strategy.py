@@ -36,6 +36,36 @@ import copy
 OG_REGEX = re.compile(r"^og:")
 TWITTER_REGEX = re.compile(r"^twitter:")
 DIMENSION_REGEX = re.compile(r"(\d+)(\D*)")
+NOSCRIPT_OPEN_REGEX = re.compile(r"<noscript\b[^>]*>", re.IGNORECASE)
+NOSCRIPT_CLOSE_REGEX = re.compile(r"</noscript\s*>", re.IGNORECASE)
+RAW_TEXT_REGEX = re.compile(
+    r"<script\b.*?(?:</script\s*>|\Z)|<style\b.*?(?:</style\s*>|\Z)|<!--.*?(?:-->|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def unwrap_orphaned_noscript(html: str) -> str:
+    """Drop <noscript> tags, keeping their contents, when one is left unclosed.
+
+    Pages that nest <noscript> (lazy-load plugins commonly wrap Google Tag
+    Manager's own noscript) lose a closing tag when a scripting-enabled browser
+    serializes them: the browser ends the element at the first </noscript> and
+    discards the stray one. lxml parses with scripting disabled, so it nests the
+    rest of the document inside the still-open element, and the noscript
+    removal below then deletes the whole page.
+
+    Unbalanced tag counts identify that serialization damage, so well-formed
+    documents are returned untouched. Tags inside <script>, <style> and
+    comments are only text, so they are left out of the count. An unclosed
+    one runs to the end of the document, as in a browser, which also keeps
+    the scan linear on pages with many unclosed openers.
+    """
+    markup = RAW_TEXT_REGEX.sub("", html)
+    opens = len(NOSCRIPT_OPEN_REGEX.findall(markup))
+    closes = len(NOSCRIPT_CLOSE_REGEX.findall(markup))
+    if opens <= closes:
+        return html
+    return NOSCRIPT_CLOSE_REGEX.sub("", NOSCRIPT_OPEN_REGEX.sub("", html))
 
 
 # Function to parse srcset
@@ -247,7 +277,9 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             if base_element:
                 base_href = base_element[0].get("href", "").strip()
                 if base_href:
-                    url = base_href
+                    # <base href> may be relative to the page URL; resolve it so
+                    # links stay absolute, like the no-<base> path.
+                    url = urljoin(url, base_href)
         except Exception as e:
             self._log("error", f"Error extracting base URL: {str(e)}", "SCRAPE")
             pass
@@ -258,7 +290,11 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 continue
 
             try:
-                normalized_href = normalize_url(href, url)
+                normalized_href = normalize_url(
+                    href, url,
+                    preserve_https=kwargs.get('preserve_https_for_internal_links', False),
+                    original_scheme=kwargs.get('original_scheme')
+                )
                 link_data = {
                     "href": normalized_href,
                     "text": link.text_content().strip(),
@@ -293,7 +329,7 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                         kwargs.get("exclude_external_links", False)
                         or link_base_domain in exclude_domains
                     ):
-                        link.getparent().remove(link)
+                        link.drop_tree()
                         continue
 
                     if normalized_href not in external_links_dict:
@@ -321,9 +357,8 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 kwargs.get("exclude_external_images", False)
                 and is_external_url(src, base_domain)
             ):
-                parent = img.getparent()
-                if parent is not None:
-                    parent.remove(img)
+                if img.getparent() is not None:
+                    img.drop_tree()
                 continue
 
             # Otherwise, process the image as usual.
@@ -357,17 +392,17 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
         # Clean up unwanted elements
         if kwargs.get("remove_forms", False):
             for form in element.xpath(".//form"):
-                form.getparent().remove(form)
+                form.drop_tree()
 
         if excluded_tags := kwargs.get("excluded_tags", []):
             for tag in excluded_tags:
                 for elem in element.xpath(f".//{tag}"):
-                    elem.getparent().remove(elem)
+                    elem.drop_tree()
 
         if excluded_selector := kwargs.get("excluded_selector", ""):
             try:
                 for elem in element.cssselect(excluded_selector):
-                    elem.getparent().remove(elem)
+                    elem.drop_tree()
             except Exception:
                 pass  # Invalid selector
 
@@ -538,6 +573,19 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             if el.tag in bypass_tags:
                 continue
 
+            # Skip elements inside <pre> or <code> tags where whitespace is significant
+            # This preserves whitespace-only spans (e.g., <span class="w"> </span>) in code blocks
+            is_in_code_block = False
+            ancestor = el.getparent()
+            while ancestor is not None:
+                if ancestor.tag in ("pre", "code"):
+                    is_in_code_block = True
+                    break
+                ancestor = ancestor.getparent()
+
+            if is_in_code_block:
+                continue
+
             text_content = (el.text_content() or "").strip()
             if (
                 len(text_content.split()) < word_count_threshold
@@ -545,6 +593,18 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             ):
                 parent = el.getparent()
                 if parent is not None:
+                    # Preserve .tail text before removing the element
+                    tail = el.tail
+                    if el.text and not text_content:
+                        # A whitespace-only element separates the words around
+                        # it, so keep one space where it was.
+                        tail = " " + (tail or "")
+                    if tail:
+                        prev = el.getprevious()
+                        if prev is not None:
+                            prev.tail = (prev.tail or "") + tail
+                        else:
+                            parent.text = (parent.text or "") + tail
                     parent.remove(el)
 
         return root
@@ -601,7 +661,7 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
 
         success = True
         try:
-            doc = lhtml.document_fromstring(html)
+            doc = lhtml.document_fromstring(unwrap_orphaned_noscript(html))
             # Match BeautifulSoup's behavior of using body or full doc
             # body = doc.xpath('//body')[0] if doc.xpath('//body') else doc
             body = doc
@@ -640,13 +700,15 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             if kwargs.get("exclude_all_images", False):
                 for img in body.xpath('//img'):
                     if img.getparent() is not None:
-                        img.getparent().remove(img)
+                        img.drop_tree()
 
             # Add comment removal
             if kwargs.get("remove_comments", False):
                 comments = body.xpath("//comment()")
                 for comment in comments:
-                    comment.getparent().remove(comment)
+                    # A comment outside <html> has no parent
+                    if comment.getparent() is not None:
+                        comment.drop_tree()
 
             # Handle tag-based removal first
             excluded_tags = set(kwargs.get("excluded_tags", []) or [])
@@ -654,7 +716,7 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 for tag in excluded_tags:
                     for element in body.xpath(f".//{tag}"):
                         if element.getparent() is not None:
-                            element.getparent().remove(element)
+                            element.drop_tree()
 
             # Handle CSS selector-based exclusion
             excluded_selector = kwargs.get("excluded_selector", "")
@@ -662,7 +724,7 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 try:
                     for element in body.cssselect(excluded_selector):
                         if element.getparent() is not None:
-                            element.getparent().remove(element)
+                            element.drop_tree()
                 except Exception as e:
                     self._log(
                         "error", f"Error with excluded CSS selector: {str(e)}", "SCRAPE"
@@ -678,24 +740,98 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 meta = {}
 
             content_element = None
+            if css_selector:
+                try:
+                    selected = body.cssselect(css_selector)
+                    if selected:
+                        content_element = lhtml.Element("div")
+                        content_element.extend(copy.deepcopy(selected))
+                    else:
+                        content_element = body
+                except Exception as e:
+                    self._log("error", f"Error with css_selector: {str(e)}", "SCRAPE")
+                    content_element = body
+
             if target_elements:
                 try:
+                    source = content_element if content_element is not None else body
                     for_content_targeted_element = []
                     for target_element in target_elements:
-                        for_content_targeted_element.extend(body.cssselect(target_element))
+                        for_content_targeted_element.extend(source.cssselect(target_element))
                     content_element = lhtml.Element("div")
                     content_element.extend(copy.deepcopy(for_content_targeted_element))
                 except Exception as e:
                     self._log("error", f"Error with target element detection: {str(e)}", "SCRAPE")
                     return None
-            else:
+            elif content_element is None:
                 content_element = body
 
-            # Remove script and style tags
-            for tag in ["script", "style", "link", "meta", "noscript"]:
+            # Replace mermaid SVGs with text before they get stripped
+            for svg in body.xpath('.//svg[starts-with(@id, "mermaid-")]'):
+                try:
+                    diagram_type = svg.get("aria-roledescription", "diagram")
+                    labels = []
+                    seen = set()
+
+                    # Primary: foreignObject-based labels (flowchart, class, state…)
+                    for el in svg.cssselect(".nodeLabel, .label span, .edgeLabel span"):
+                        text = el.text_content().strip()
+                        if text and text not in seen:
+                            seen.add(text)
+                            labels.append(text)
+
+                    # Fallback: native SVG text/tspan elements (sequence, gantt, git…)
+                    if not labels:
+                        for el in svg.xpath(
+                            './/*[local-name()="text"] | .//*[local-name()="tspan"]'
+                        ):
+                            text = (el.text or "").strip()
+                            if text and text not in seen:
+                                seen.add(text)
+                                labels.append(text)
+
+                    if not labels:
+                        continue
+
+                    # Check whether the SVG already lives inside a <pre> block.
+                    # If so, avoid creating a nested fence; just let the outer
+                    # <pre> preserve the text that lxml has already flattened.
+                    ancestor = svg.getparent()
+                    inside_pre = False
+                    while ancestor is not None:
+                        if ancestor.tag == "pre":
+                            inside_pre = True
+                            break
+                        ancestor = ancestor.getparent()
+
+                    if inside_pre:
+                        # The outer <pre> will format the text as a code block.
+                        # Replace the SVG with a plain span so lxml preserves
+                        # the label text without the SVG markup noise.
+                        placeholder = lhtml.Element("span")
+                        placeholder.text = "\n".join(labels)
+                    else:
+                        # Build a fenced code block that survives markdown conversion
+                        placeholder = lhtml.Element("pre")
+                        placeholder.set("data-language", "mermaid")
+                        code = etree.SubElement(placeholder, "code")
+                        code.set("class", "language-mermaid")
+                        code.text = f"%% {diagram_type} diagram\n" + "\n".join(labels)
+
+                    # replace() drops the SVG's tail, so carry it over
+                    placeholder.tail = svg.tail
+                    parent = svg.getparent()
+                    if parent is not None:
+                        parent.replace(svg, placeholder)
+                except Exception:
+                    pass
+
+            # Remove script and style tags. drop_tree() keeps the text after
+            # each one (its .tail), which remove() would throw away.
+            for tag in ["style", "link", "meta", "noscript", "script"]:
                 for element in body.xpath(f".//{tag}"):
                     if element.getparent() is not None:
-                        element.getparent().remove(element)
+                        element.drop_tree()
 
             # Handle social media and domain exclusions
             kwargs["exclude_domains"] = set(kwargs.get("exclude_domains", []))
@@ -710,7 +846,7 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             if kwargs.get("remove_forms", False):
                 for form in body.xpath(".//form"):
                     if form.getparent() is not None:
-                        form.getparent().remove(form)
+                        form.drop_tree()
 
             # Process content
             media = {"images": [], "videos": [], "audios": [], "tables": []}

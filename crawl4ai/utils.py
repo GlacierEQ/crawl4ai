@@ -36,6 +36,7 @@ from functools import lru_cache
 
 from packaging import version
 from . import __version__
+from .egress_policy import proxy_url
 from typing import Sequence
 
 from itertools import chain
@@ -47,29 +48,71 @@ from urllib.parse import (
     urljoin, urlparse, urlunparse,
     parse_qsl, urlencode, quote, unquote
 )
+import inspect
 
 
-# Monkey patch to fix wildcard handling in urllib.robotparser
-from urllib.robotparser import RuleLine
-import re
+# Monkey patch to fix wildcard handling in urllib.robotparser.
+# Python 3.14 rewrote robotparser with native wildcard, '$' and RFC 9309
+# longest-match support, and its applies_to returns a match *length* used to
+# rank rules. Patching it there returns a bool, which collapses every wildcard
+# rule to the lowest priority and breaks Allow: overrides -- so only patch the
+# older implementation, which has no wildcard support at all.
+import sys
 
-original_applies_to = RuleLine.applies_to
+if sys.version_info < (3, 14):
+    from urllib.robotparser import RuleLine
 
-def patched_applies_to(self, filename):
-   # Handle wildcards in paths
-   if '*' in self.path or '%2A' in self.path or self.path in ("*", "%2A"):
-       pattern = self.path.replace('%2A', '*')
-       pattern = re.escape(pattern).replace('\\*', '.*')
-       pattern = '^' + pattern
-       if pattern.endswith('\\$'):
-           pattern = pattern[:-2] + '$'
-       try:
-           return bool(re.match(pattern, filename))
-       except re.error:
-           return original_applies_to(self, filename)
-   return original_applies_to(self, filename)
+    # RobotFileParser.parse unquotes rule paths before RuleLine quotes them
+    # again, which collapses raw '*'/'$' and percent-encoded '%2A'/'%24' into
+    # the same '%2A'/'%24' tokens. Mark percent-encoded '%2A' and '%24' before
+    # parse() unquotes the line so they stay literal instead of acting as a
+    # wildcard or end anchor.
+    _LITERAL_STAR = "%EE%80%80"
+    _LITERAL_DOLLAR = "%EE%80%81"
+    original_parse = RobotFileParser.parse
+    original_applies_to = RuleLine.applies_to
 
-RuleLine.applies_to = patched_applies_to
+    def _escape_encoded_specials(line: str) -> str:
+        body, hash_sep, comment = line.partition("#")
+        key, sep, value = body.partition(":")
+        if sep and key.strip().lower() in ("allow", "disallow"):
+            value = re.sub(
+                r"%([0-9A-Fa-f]{2})",
+                lambda m: (
+                    "\ue000"
+                    if m.group(1).upper() == "2A"
+                    else ("\ue001" if m.group(1) == "24" else m.group(0))
+                ),
+                value,
+            )
+            return f"{key}:{value}" + (f"#{comment}" if hash_sep else "")
+        return line
+
+    def patched_parse(self, lines):
+        return original_parse(self, (_escape_encoded_specials(line) for line in lines))
+
+    def patched_applies_to(self, filename):
+        if "*" in self.path or "%2A" in self.path or self.path.endswith("%24"):
+            pattern = self.path.replace("%2A", "*")
+            pattern = "^" + re.escape(pattern).replace("\\*", ".*")
+            if pattern.endswith("%24"):
+                pattern = pattern[:-3] + "$"
+            pattern = pattern.replace(_LITERAL_STAR, "%2A").replace(
+                _LITERAL_DOLLAR, "%24"
+            )
+            try:
+                return bool(re.match(pattern, filename))
+            except re.error:
+                return original_applies_to(self, filename)
+        if _LITERAL_STAR in self.path or _LITERAL_DOLLAR in self.path:
+            path = self.path.replace(_LITERAL_STAR, "%2A").replace(
+                _LITERAL_DOLLAR, "%24"
+            )
+            return filename.startswith(path)
+        return original_applies_to(self, filename)
+
+    RobotFileParser.parse = patched_parse
+    RuleLine.applies_to = patched_applies_to
 # Monkey patch ends
 
 def chunk_documents(
@@ -225,7 +268,7 @@ def merge_chunks(
 
 class VersionManager:
     def __init__(self):
-        self.home_dir = Path.home() / ".crawl4ai"
+        self.home_dir = Path(os.getenv("CRAWL4_AI_BASE_DIRECTORY", Path.home())) / ".crawl4ai"
         self.version_file = self.home_dir / "version.txt"
 
     def get_installed_version(self):
@@ -246,6 +289,28 @@ class VersionManager:
         installed = self.get_installed_version()
         current = version.parse(__version__.__version__)
         return installed is None or installed < current
+
+
+def _preserve_bare_query(rules_text: str) -> str:
+    """Append '*' to Allow/Disallow values ending in a bare '?' (e.g. '/*?').
+
+    Only correct below Python 3.14, and only called there. Those parsers drop a
+    trailing '?' when normalizing the rule path, collapsing '/*?' to '/*' and
+    blocking the whole site; they also take the first matching rule, so making a
+    rule longer cannot change which one wins.
+
+    From 3.14 the stdlib keeps the '?' and ranks rules by match length, and the
+    rewrite becomes actively wrong: '/*?*' matches to end of string, so it
+    outranks a competing 'Allow: /*?q=' that the raw '/*?' would have lost to.
+    """
+    fixed = []
+    for raw_line in rules_text.splitlines():
+        body, _, _ = raw_line.partition("#")
+        key, sep, value = body.partition(":")
+        if sep and key.strip().lower() in ("allow", "disallow") and value.strip().endswith("?"):
+            raw_line = f"{key.strip()}: {value.strip()}*"
+        fixed.append(raw_line)
+    return "\n".join(fixed)
 
 
 class RobotsParser:
@@ -339,8 +404,16 @@ class RobotsParser:
                 scheme = parsed.scheme or 'http'
                 robots_url = f"{scheme}://{domain}/robots.txt"
                 
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(robots_url, timeout=2, ssl=False) as response:
+                # proxy=None unless an embedder installed one (the Docker
+                # server does). Without it this fetch is a caller-chosen URL on
+                # an unguarded client: it reached internal hosts directly and
+                # followed redirects into them.
+                # ssl=False is gone: a bad certificate now raises, and the
+                # except below fails open, so robots is ignored rather than
+                # respected -- more crawling, never a broken crawl.
+                timeout = aiohttp.ClientTimeout(total=2)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(robots_url, proxy=proxy_url()) as response:
                         if response.status == 200:
                             rules = await response.text()
                             self._cache_rules(domain, rules)
@@ -354,7 +427,12 @@ class RobotsParser:
             return True
 
         # Create parser for this check
-        parser = RobotFileParser() 
+        parser = RobotFileParser()
+        # Below 3.14, rewrite rules ending in a bare '?' so they survive path
+        # normalization. From 3.14 the stdlib handles them, and the rewrite
+        # would skew its longest-match ranking -- see _preserve_bare_query.
+        if sys.version_info < (3, 14):
+            rules = _preserve_bare_query(rules)
         parser.parse(rules.splitlines())
         
         # If parser can't read rules, allow access
@@ -1696,7 +1774,7 @@ def extract_xml_data_legacy(tags, string):
     data = {}
 
     for tag in tags:
-        pattern = f"<{tag}>(.*?)</{tag}>"
+        pattern = f"<{tag}>((?:(?!<{tag}>).)*)</{tag}>"
         match = re.search(pattern, string, re.DOTALL)
         if match:
             data[tag] = match.group(1).strip()
@@ -1725,7 +1803,7 @@ def extract_xml_data(tags, string):
     data = {}
 
     for tag in tags:
-        pattern = f"<{tag}>(.*?)</{tag}>"
+        pattern = f"<{tag}>((?:(?!<{tag}>).)*)</{tag}>"
         matches = re.findall(pattern, string, re.DOTALL)
         
         if matches:
@@ -1744,6 +1822,10 @@ def perform_completion_with_backoff(
     api_token,
     json_response=False,
     base_url=None,
+    base_delay=2,
+    max_attempts=3,
+    exponential_factor=2,
+    messages=None,
     **kwargs,
 ):
     """
@@ -1760,6 +1842,9 @@ def perform_completion_with_backoff(
         api_token (str): The API token for authentication.
         json_response (bool): Whether to request a JSON response. Defaults to False.
         base_url (Optional[str]): The base URL for the API. Defaults to None.
+        base_delay (int): The base delay in seconds. Defaults to 2.
+        max_attempts (int): The maximum number of attempts. Defaults to 3.
+        exponential_factor (int): The exponential factor. Defaults to 2.
         **kwargs: Additional arguments for the API request.
 
     Returns:
@@ -1768,11 +1853,12 @@ def perform_completion_with_backoff(
 
     from litellm import completion
     from litellm.exceptions import RateLimitError
+    import litellm
+    litellm.drop_params = True  # Auto-drop unsupported params (e.g., temperature for O-series/GPT-5)
 
-    max_attempts = 3
-    base_delay = 2  # Base delay in seconds, you can adjust this based on your needs
-
-    extra_args = {"temperature": 0.01, "api_key": api_token, "base_url": base_url}
+    # No default temperature: reasoning models (GPT-5, gpt-6-luna) reject anything
+    # but 1, and litellm can't drop it for models it doesn't know. Set it in extra_args.
+    extra_args = {"api_key": api_token, "base_url": base_url}
     if json_response:
         extra_args["response_format"] = {"type": "json_object"}
 
@@ -1783,17 +1869,21 @@ def perform_completion_with_backoff(
         try:
             response = completion(
                 model=provider,
-                messages=[{"role": "user", "content": prompt_with_variables}],
+                messages=messages if messages is not None else [{"role": "user", "content": prompt_with_variables}],
                 **extra_args,
             )
             return response  # Return the successful response
         except RateLimitError as e:
             print("Rate limit error:", str(e))
 
+            if attempt == max_attempts - 1:
+                # Last attempt failed, raise the error.
+                raise
+
             # Check if we have exhausted our max attempts
             if attempt < max_attempts - 1:
                 # Calculate the delay and wait
-                delay = base_delay * (2**attempt)  # Exponential backoff formula
+                delay = base_delay * (exponential_factor**attempt)  # Exponential backoff formula
                 print(f"Waiting for {delay} seconds before retrying...")
                 time.sleep(delay)
             else:
@@ -1818,6 +1908,90 @@ def perform_completion_with_backoff(
             #         ],
             #     }
             # ]
+
+
+async def aperform_completion_with_backoff(
+    provider,
+    prompt_with_variables,
+    api_token,
+    json_response=False,
+    base_url=None,
+    base_delay=2,
+    max_attempts=3,
+    exponential_factor=2,
+    messages=None,
+    **kwargs,
+):
+    """
+    Async version: Perform an API completion request with exponential backoff.
+
+    How it works:
+    1. Sends an async completion request to the API.
+    2. Retries on rate-limit errors with exponential delays (async).
+    3. Returns the API response or an error after all retries.
+
+    Args:
+        provider (str): The name of the API provider.
+        prompt_with_variables (str): The input prompt for the completion request.
+        api_token (str): The API token for authentication.
+        json_response (bool): Whether to request a JSON response. Defaults to False.
+        base_url (Optional[str]): The base URL for the API. Defaults to None.
+        base_delay (int): The base delay in seconds. Defaults to 2.
+        max_attempts (int): The maximum number of attempts. Defaults to 3.
+        exponential_factor (int): The exponential factor. Defaults to 2.
+        **kwargs: Additional arguments for the API request.
+
+    Returns:
+        dict: The API response or an error message after all retries.
+    """
+
+    from litellm import acompletion
+    from litellm.exceptions import RateLimitError
+    import litellm
+    import asyncio
+    litellm.drop_params = True  # Auto-drop unsupported params (e.g., temperature for O-series/GPT-5)
+
+    # No default temperature: reasoning models (GPT-5, gpt-6-luna) reject anything
+    # but 1, and litellm can't drop it for models it doesn't know. Set it in extra_args.
+    extra_args = {"api_key": api_token, "base_url": base_url}
+    if json_response:
+        extra_args["response_format"] = {"type": "json_object"}
+
+    if kwargs.get("extra_args"):
+        extra_args.update(kwargs["extra_args"])
+
+    for attempt in range(max_attempts):
+        try:
+            response = await acompletion(
+                model=provider,
+                messages=messages if messages is not None else [{"role": "user", "content": prompt_with_variables}],
+                **extra_args,
+            )
+            return response  # Return the successful response
+        except RateLimitError as e:
+            print("Rate limit error:", str(e))
+
+            if attempt == max_attempts - 1:
+                # Last attempt failed, raise the error.
+                raise
+
+            # Check if we have exhausted our max attempts
+            if attempt < max_attempts - 1:
+                # Calculate the delay and wait
+                delay = base_delay * (exponential_factor**attempt)  # Exponential backoff formula
+                print(f"Waiting for {delay} seconds before retrying...")
+                await asyncio.sleep(delay)
+            else:
+                # Return an error response after exhausting all retries
+                return [
+                    {
+                        "index": 0,
+                        "tags": ["error"],
+                        "content": ["Rate limit error. Please try again later."],
+                    }
+                ]
+        except Exception as e:
+            raise e  # Raise any other exceptions immediately
 
 
 def extract_blocks(url, html, provider=DEFAULT_PROVIDER, api_token=None, base_url=None):
@@ -1916,7 +2090,7 @@ def extract_blocks_batch(batch_data, provider="groq/llama3-70b-8192", api_token=
 
         messages.append([{"role": "user", "content": prompt_with_variables}])
 
-    responses = batch_completion(model=provider, messages=messages, temperature=0.01)
+    responses = batch_completion(model=provider, messages=messages)
 
     all_blocks = []
     for response in responses:
@@ -2069,7 +2243,7 @@ def format_html(html_string):
         str: The prettified HTML string.
     """
 
-    soup = BeautifulSoup(html_string, "lxml.parser")
+    soup = BeautifulSoup(html_string, "lxml")
     return soup.prettify()
 
 
@@ -2119,24 +2293,15 @@ def fast_format_html(html_string):
     return "\n".join(formatted)
 
 
-def normalize_url(href, base_url):
-    """Normalize URLs to ensure consistent format"""
-    from urllib.parse import urljoin, urlparse
 
-    # Parse base URL to get components
-    parsed_base = urlparse(base_url)
-    if not parsed_base.scheme or not parsed_base.netloc:
-        raise ValueError(f"Invalid base URL format: {base_url}")
-    
-    if  parsed_base.scheme.lower() not in ["http", "https"]:
-        # Handle special protocols
-        raise ValueError(f"Invalid base URL format: {base_url}")
-    cleaned_href = href.strip()
+def _lowercase_host(netloc: str) -> str:
+    """Lowercase the host of a netloc, leaving any userinfo as written.
 
-    # Use urljoin to handle all cases
-    return urljoin(base_url, cleaned_href)
-
-
+    A host is case-insensitive, but the `user:password` part in front of it is
+    not: lowercasing the whole netloc rewrites credentials taken from a URL.
+    """
+    userinfo, separator, hostport = netloc.rpartition('@')
+    return f"{userinfo}{separator}{hostport.lower()}"
 
 
 def normalize_url(
@@ -2146,7 +2311,9 @@ def normalize_url(
     drop_query_tracking=True,
     sort_query=True,
     keep_fragment=False,
-    extra_drop_params=None
+    extra_drop_params=None,
+    preserve_https=False,
+    original_scheme=None
 ):
     """
     Extended URL normalizer
@@ -2176,24 +2343,37 @@ def normalize_url(
 
     # Resolve relative paths first
     full_url = urljoin(base_url, href.strip())
+    
+    # Preserve HTTPS if requested and original scheme was HTTPS
+    if preserve_https and original_scheme == 'https':
+        parsed_full = urlparse(full_url)
+        parsed_base = urlparse(base_url)
+        # Only preserve HTTPS for same-domain links (not protocol-relative URLs)
+        # Protocol-relative URLs (//example.com) should follow the base URL's scheme
+        if (parsed_full.scheme == 'http' and 
+            parsed_full.netloc == parsed_base.netloc and
+            not href.strip().startswith('//')):
+            full_url = full_url.replace('http://', 'https://', 1)
 
     # Parse once, edit parts, then rebuild
     parsed = urlparse(full_url)
 
     # ── netloc ──
-    netloc = parsed.netloc.lower()
+    netloc = _lowercase_host(parsed.netloc)
 
     # ── path ──
-    # Strip duplicate slashes and trailing “/” (except root)
-    path = quote(unquote(parsed.path))
-    if path.endswith('/') and path != '/':
-        path = path.rstrip('/')
+    # Strip duplicate slashes and trailing "/" (except root)
+    # IMPORTANT: Don't use quote(unquote()) as it mangles + signs in URLs
+    # The path from urlparse is already properly encoded
+    path = parsed.path
+    # Preserve trailing slashes -- they are semantically significant per RFC 3986
+    # e.g. /page/9123/ and /page/9123 may return different responses
 
     # ── query ──
     query = parsed.query
     if query:
         # explode, mutate, then rebuild
-        params = [(k.lower(), v) for k, v in parse_qsl(query, keep_blank_values=True)]
+        params = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True)]
 
         if drop_query_tracking:
             default_tracking = {
@@ -2202,7 +2382,7 @@ def normalize_url(
             }
             if extra_drop_params:
                 default_tracking |= {p.lower() for p in extra_drop_params}
-            params = [(k, v) for k, v in params if k not in default_tracking]
+            params = [(k, v) for k, v in params if k.lower() not in default_tracking]
 
         if sort_query:
             params.sort(key=lambda kv: kv[0])
@@ -2225,7 +2405,7 @@ def normalize_url(
     return normalized
 
 
-def normalize_url_for_deep_crawl(href, base_url):
+def normalize_url_for_deep_crawl(href, base_url, preserve_https=False, original_scheme=None):
     """Normalize URLs to ensure consistent format"""
     from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
 
@@ -2236,11 +2416,22 @@ def normalize_url_for_deep_crawl(href, base_url):
     # Use urljoin to handle relative URLs
     full_url = urljoin(base_url, href.strip())
     
+    # Preserve HTTPS if requested and original scheme was HTTPS
+    if preserve_https and original_scheme == 'https':
+        parsed_full = urlparse(full_url)
+        parsed_base = urlparse(base_url)
+        # Only preserve HTTPS for same-domain links (not protocol-relative URLs)
+        # Protocol-relative URLs (//example.com) should follow the base URL's scheme
+        if (parsed_full.scheme == 'http' and 
+            parsed_full.netloc == parsed_base.netloc and
+            not href.strip().startswith('//')):
+            full_url = full_url.replace('http://', 'https://', 1)
+    
     # Parse the URL for normalization
     parsed = urlparse(full_url)
     
     # Convert hostname to lowercase
-    netloc = parsed.netloc.lower()
+    netloc = _lowercase_host(parsed.netloc)
     
     # Remove fragment entirely
     fragment = ''
@@ -2264,7 +2455,7 @@ def normalize_url_for_deep_crawl(href, base_url):
     normalized = urlunparse((
         parsed.scheme,
         netloc,
-        parsed.path.rstrip('/'),  # Normalize trailing slash
+        parsed.path or '/',  # Preserve trailing slash
         parsed.params,
         query,
         fragment
@@ -2273,7 +2464,7 @@ def normalize_url_for_deep_crawl(href, base_url):
     return normalized
 
 @lru_cache(maxsize=10000)
-def efficient_normalize_url_for_deep_crawl(href, base_url):
+def efficient_normalize_url_for_deep_crawl(href, base_url, preserve_https=False, original_scheme=None):
     """Efficient URL normalization with proper parsing"""
     from urllib.parse import urljoin
     
@@ -2283,6 +2474,17 @@ def efficient_normalize_url_for_deep_crawl(href, base_url):
     # Resolve relative URLs
     full_url = urljoin(base_url, href.strip())
     
+    # Preserve HTTPS if requested and original scheme was HTTPS
+    if preserve_https and original_scheme == 'https':
+        parsed_full = urlparse(full_url)
+        parsed_base = urlparse(base_url)
+        # Only preserve HTTPS for same-domain links (not protocol-relative URLs)
+        # Protocol-relative URLs (//example.com) should follow the base URL's scheme
+        if (parsed_full.scheme == 'http' and 
+            parsed_full.netloc == parsed_base.netloc and
+            not href.strip().startswith('//')):
+            full_url = full_url.replace('http://', 'https://', 1)
+    
     # Use proper URL parsing
     parsed = urlparse(full_url)
     
@@ -2291,8 +2493,8 @@ def efficient_normalize_url_for_deep_crawl(href, base_url):
     # 2. Remove fragment
     normalized = urlunparse((
         parsed.scheme,
-        parsed.netloc.lower(),
-        parsed.path.rstrip('/'),
+        _lowercase_host(parsed.netloc),
+        parsed.path or '/',  # Preserve trailing slash
         parsed.params,
         parsed.query,
         ''  # Remove fragment
@@ -2301,40 +2503,69 @@ def efficient_normalize_url_for_deep_crawl(href, base_url):
     return normalized
 
 
-def normalize_url_tmp(href, base_url):
-    """Normalize URLs to ensure consistent format"""
-    # Extract protocol and domain from base URL
+
+def quick_extract_links(html: str, base_url: str) -> Dict[str, List[Dict[str, str]]]:
+    """
+    Fast link extraction for prefetch mode.
+    Only extracts <a href> tags - no media, no cleaning, no heavy processing.
+
+    Args:
+        html: Raw HTML string
+        base_url: Base URL for resolving relative links
+
+    Returns:
+        {"internal": [{"href": "...", "text": "..."}], "external": [...]}
+    """
+    from lxml.html import document_fromstring
+
     try:
-        base_parts = base_url.split("/")
-        protocol = base_parts[0]
-        domain = base_parts[2]
-    except IndexError:
-        raise ValueError(f"Invalid base URL format: {base_url}")
+        doc = document_fromstring(html)
+    except Exception:
+        return {"internal": [], "external": []}
 
-    # Handle special protocols
-    special_protocols = {"mailto:", "tel:", "ftp:", "file:", "data:", "javascript:"}
-    if any(href.lower().startswith(proto) for proto in special_protocols):
-        return href.strip()
+    # base_domain stays anchored to the real page origin so internal/external
+    # classification is correct even when a <base> tag points elsewhere.
+    base_domain = get_base_domain(base_url)
 
-    # Handle anchor links
-    if href.startswith("#"):
-        return f"{base_url}{href}"
+    # Honor <head><base href> for relative-URL resolution (#752). The full LXML
+    # scraping path does this; the prefetch quick path (used by scan/site) must
+    # too — otherwise relative links resolve against the page URL and the base
+    # tag is ignored. urljoin handles a relative <base href> against the page.
+    try:
+        base_el = doc.xpath("//head/base[@href]")
+        if base_el:
+            base_href = (base_el[0].get("href") or "").strip()
+            if base_href:
+                base_url = urljoin(base_url, base_href)
+    except Exception:
+        pass
 
-    # Handle protocol-relative URLs
-    if href.startswith("//"):
-        return f"{protocol}{href}"
+    internal: List[Dict[str, str]] = []
+    external: List[Dict[str, str]] = []
+    seen: Set[str] = set()
 
-    # Handle root-relative URLs
-    if href.startswith("/"):
-        return f"{protocol}//{domain}{href}"
+    for a in doc.xpath("//a[@href]"):
+        href = a.get("href", "").strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
 
-    # Handle relative URLs
-    if not href.startswith(("http://", "https://")):
-        # Remove leading './' if present
-        href = href.lstrip("./")
-        return f"{protocol}//{domain}/{href}"
+        # Normalize URL
+        normalized = normalize_url_for_deep_crawl(href, base_url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
 
-    return href.strip()
+        # Extract text (truncated for memory efficiency)
+        text = (a.text_content() or "").strip()[:200]
+
+        link_data = {"href": normalized, "text": text}
+
+        if is_external_url(normalized, base_domain):
+            external.append(link_data)
+        else:
+            internal.append(link_data)
+
+    return {"internal": internal, "external": external}
 
 
 def get_base_domain(url: str) -> str:
@@ -2412,9 +2643,9 @@ def is_external_url(url: str, base_domain: str) -> bool:
         if not parsed.netloc:  # Relative URL
             return False
 
-        # Strip 'www.' from both domains for comparison
-        url_domain = parsed.netloc.lower().replace("www.", "")
-        base = base_domain.lower().replace("www.", "")
+        # Strip port and 'www.' from both domains for comparison
+        url_domain = parsed.netloc.lower().split(":")[0].replace("www.", "")
+        base = base_domain.lower().split(":")[0].replace("www.", "")
 
         # Check if URL domain ends with base domain
         return not url_domain.endswith(base)
@@ -2704,6 +2935,67 @@ def generate_content_hash(content: str) -> str:
     # return hashlib.sha256(content.encode()).hexdigest()
 
 
+def compute_head_fingerprint(head_html: str) -> str:
+    """
+    Compute a fingerprint of <head> content for cache validation.
+
+    Focuses on content that typically changes when page updates:
+    - <title>
+    - <meta name="description">
+    - <meta property="og:title|og:description|og:image|og:updated_time">
+    - <meta property="article:modified_time">
+    - <meta name="last-modified">
+
+    Uses xxhash for speed, combines multiple signals into a single hash.
+
+    Args:
+        head_html: The HTML content of the <head> section
+
+    Returns:
+        A hex string fingerprint, or empty string if no signals found
+    """
+    if not head_html:
+        return ""
+
+    head_lower = head_html.lower()
+    signals = []
+
+    # Extract title
+    title_match = re.search(r'<title[^>]*>(.*?)</title>', head_lower, re.DOTALL)
+    if title_match:
+        signals.append(title_match.group(1).strip())
+
+    # Meta tags to extract (name or property attribute, and the value to match)
+    meta_tags = [
+        ("name", "description"),
+        ("name", "last-modified"),
+        ("property", "og:title"),
+        ("property", "og:description"),
+        ("property", "og:image"),
+        ("property", "og:updated_time"),
+        ("property", "article:modified_time"),
+    ]
+
+    for attr_type, attr_value in meta_tags:
+        # Handle both attribute orders: attr="value" content="..." and content="..." attr="value"
+        patterns = [
+            rf'<meta[^>]*{attr_type}=["\']{ re.escape(attr_value)}["\'][^>]*content=["\']([^"\']*)["\']',
+            rf'<meta[^>]*content=["\']([^"\']*)["\'][^>]*{attr_type}=["\']{re.escape(attr_value)}["\']',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, head_lower)
+            if match:
+                signals.append(match.group(1).strip())
+                break  # Found this tag, move to next
+
+    if not signals:
+        return ""
+
+    # Combine signals and hash
+    combined = '|'.join(signals)
+    return xxhash.xxh64(combined.encode()).hexdigest()
+
+
 def ensure_content_dirs(base_path: str) -> Dict[str, str]:
     """Create content directories if they don't exist"""
     dirs = {
@@ -2893,10 +3185,13 @@ def preprocess_html_for_schema(html_content, text_threshold=100, attr_value_thre
     Returns:
         str: Preprocessed HTML content
     """
+    # Local import: content_scraping_strategy imports from this module.
+    from .content_scraping_strategy import unwrap_orphaned_noscript
+
     try:
         # Parse HTML with error recovery
         parser = etree.HTMLParser(remove_comments=True, remove_blank_text=True)
-        tree = lhtml.fromstring(html_content, parser=parser)
+        tree = lhtml.fromstring(unwrap_orphaned_noscript(html_content), parser=parser)
         
         # 1. Remove HEAD section (keep only BODY)
         head_elements = tree.xpath('//head')
@@ -3489,3 +3784,51 @@ def get_memory_stats() -> Tuple[float, float, float]:
     used_percent = get_true_memory_usage_percent()
     
     return used_percent, available_gb, total_gb
+
+
+# Hook utilities for Docker API
+def hooks_to_string(hooks: Dict[str, Callable]) -> Dict[str, str]:
+    """
+    Convert hook function objects to string representations for Docker API.
+
+    This utility simplifies the process of using hooks with the Docker API by converting
+    Python function objects into the string format required by the API.
+
+    Args:
+        hooks: Dictionary mapping hook point names to Python function objects.
+               Functions should be async and follow hook signature requirements.
+
+    Returns:
+        Dictionary mapping hook point names to string representations of the functions.
+
+    Example:
+        >>> async def my_hook(page, context, **kwargs):
+        ...     await page.set_viewport_size({"width": 1920, "height": 1080})
+        ...     return page
+        >>>
+        >>> hooks_dict = {"on_page_context_created": my_hook}
+        >>> api_hooks = hooks_to_string(hooks_dict)
+        >>> # api_hooks is now ready to use with Docker API
+
+    Raises:
+        ValueError: If a hook is not callable or source cannot be extracted
+    """
+    result = {}
+
+    for hook_name, hook_func in hooks.items():
+        if not callable(hook_func):
+            raise ValueError(f"Hook '{hook_name}' must be a callable function, got {type(hook_func)}")
+
+        try:
+            # Get the source code of the function
+            source = inspect.getsource(hook_func)
+            # Remove any leading indentation to get clean source
+            source = textwrap.dedent(source)
+            result[hook_name] = source
+        except (OSError, TypeError) as e:
+            raise ValueError(
+                f"Cannot extract source code for hook '{hook_name}'. "
+                f"Make sure the function is defined in a file (not interactively). Error: {e}"
+            )
+
+    return result

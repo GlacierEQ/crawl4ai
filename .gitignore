@@ -1,6 +1,13 @@
 # Scripts folder (private tools)
 .scripts/
 
+# Database files
+*.db
+
+# Environment files
+.env
+.env.local
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -259,15 +266,48 @@ continue_config.json
 .llm.env
 .private/
 
+.claude/
+.context/
+
 CLAUDE_MONITOR.md
 CLAUDE.md
+
+.claude/
 
 tests/**/test_site
 tests/**/reports
 tests/**/benchmark_reports
-
+test_scripts/
 docs/**/data
 .codecat/
 
 docs/apps/linkdin/debug*/
 docs/apps/linkdin/samples/insights/*
+
+scripts/
+!scripts/gen-sbom.sh
+!scripts/update_stats.py
+
+
+# Databse files
+*.sqlite3
+*.sqlite3-journal
+*.db-journal
+*.db-wal
+*.db-shm
+*.db
+*.rdb
+*.ldb
+MEMORY.md
+
+# Handoff files
+HANDOFF-*.md
+
+# Security advisory payloads - kept private, published via GitHub Security Advisories only
+.security/
+
+# Local pipeline/run output
+out/
+
+# entrypoint.sh is a required deployment artifact (Dockerfile COPYs it)
+!deploy/docker/entrypoint.sh
